@@ -1,0 +1,38 @@
+name: junction
+
+# Phase 0 topology: one client-facing proxy in front of one chaos backend.
+# `wrk` is behind the `load` profile so `docker compose up` stays lightweight;
+# run it explicitly to produce the throughput number.
+
+services:
+  backend-1:
+    build: .
+    image: junction-spike:latest
+    environment:
+      MAIN: io.junction.spike.ChaosBackend
+      BACKEND_PORT: "8000"
+      BACKEND_ID: backend-1
+    expose:
+      - "8000"
+
+  junction:
+    build: .
+    image: junction-spike:latest
+    depends_on:
+      - backend-1
+    environment:
+      MAIN: io.junction.spike.JunctionProxy
+      PORT: "8080"
+      BACKEND_HOST: backend-1
+      BACKEND_PORT: "8000"
+    ports:
+      - "8080:8080"
+
+  # Load generator — `docker compose run --rm wrk` (or `--profile load up wrk`).
+  wrk:
+    image: williamyeh/wrk:latest
+    profiles: ["load"]
+    depends_on:
+      - junction
+    entrypoint: ["wrk"]
+    command: ["-t4", "-c64", "-d15s", "--latency", "http://junction:8080/"]
