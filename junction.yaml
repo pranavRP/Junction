@@ -1,0 +1,22 @@
+# Junction data-path configuration.
+# Every key here is validated at startup; unknown keys are a hard error.
+
+server:
+  port: 8080
+  admin_port: 9090            # bound from Phase 6
+  backlog: 4096
+  max_connections: 50000
+  max_header_bytes: 16384     # exceeded -> 431
+  max_uri_length: 8192        # exceeded -> 414
+  max_body_bytes: 2147483647  # exceeded -> 413 (2 GiB, so the 1 GB gate streams)
+  idle_timeout_ms: 60000      # idle client mid-request -> 408
+  request_timeout_ms: 30000   # backend silent this long -> 504
+  connect_timeout_ms: 1000    # cannot reach backend -> 502
+
+pools:
+  - name: api
+    backends:
+      - { id: b1, host: backend-1, port: 8000, weight: 100 }
+
+routes:
+  - { host: "*", prefix: "/", pool: api }
