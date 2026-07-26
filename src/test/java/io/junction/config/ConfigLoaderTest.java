@@ -128,6 +128,58 @@ class ConfigLoaderTest {
                 """), "duplicates an earlier pool");
     }
 
+    /**
+     * An invalid port falls back to the default internally so parsing can
+     * continue. That fallback must not then be compared against admin_port —
+     * doing so invents a conflict about a value the operator never wrote, which
+     * is exactly the confusing error this loader exists to avoid.
+     */
+    @Test
+    void invalidPortDoesNotInventAnAdminPortConflict() {
+        List<String> errors = errors("""
+                server:
+                  port: 99999
+                  admin_port: 8080
+                pools:
+                  - name: api
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """);
+
+        assertHasError(errors, "server.port must be 1..65535");
+        assertTrue(errors.stream().noneMatch(e -> e.contains("admin_port must differ")),
+                "must not report a conflict against a defaulted port, got " + errors);
+    }
+
+    /** 8080.7 is not a port. Truncating it to 8080 silently would be worse. */
+    @Test
+    void rejectsNonIntegralNumbers() {
+        assertHasError(errors("""
+                server:
+                  port: 8080.7
+                pools:
+                  - name: api
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "server.port must be a whole number");
+    }
+
+    /** Beyond long range SnakeYAML yields BigInteger, whose longValue() wraps. */
+    @Test
+    void rejectsNumbersTooLargeForLong() {
+        assertHasError(errors("""
+                server:
+                  max_connections: 99999999999999999999
+                pools:
+                  - name: api
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "server.max_connections is out of range");
+    }
+
     @Test
     void rejectsAdminPortEqualToDataPort() {
         assertHasError(errors("""

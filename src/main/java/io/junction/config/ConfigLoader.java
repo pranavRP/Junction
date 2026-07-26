@@ -95,9 +95,13 @@ public final class ConfigLoader {
                 "max_uri_length", "max_body_bytes", "idle_timeout_ms",
                 "request_timeout_ms", "connect_timeout_ms"));
 
+        int errorsBefore = v.count();
         int port = v.port("server.port", m.get("port"), d.port());
         int adminPort = v.port("server.admin_port", m.get("admin_port"), d.adminPort());
-        if (port == adminPort) {
+        // Only compare values that actually parsed. An invalid port falls back to
+        // the default internally, and comparing that fallback would report a
+        // conflict about a number the operator never wrote.
+        if (v.count() == errorsBefore && port == adminPort) {
             v.error("server.admin_port must differ from server.port (both " + port + ")");
         }
         return new ServerConfig(
@@ -221,7 +225,10 @@ public final class ConfigLoader {
             errors.add(msg);
         }
 
-        @SuppressWarnings("unchecked")
+        int count() {
+            return errors.size();
+        }
+
         Map<String, Object> asMap(String path, Object node) {
             if (node instanceof Map<?, ?> m) {
                 var copy = new LinkedHashMap<String, Object>();
@@ -266,22 +273,69 @@ public final class ConfigLoader {
             return s;
         }
 
+        /**
+         * Converts a YAML scalar to a long, refusing anything that would need to
+         * be silently altered to fit.
+         *
+         * <p>{@code Number.longValue()} is a trap here: on a Double it truncates
+         * the fraction, and on a BigInteger it keeps only the low 64 bits. Either
+         * one turns a malformed config into a plausible-looking number and lets
+         * the process start — the precise failure this loader exists to prevent.
+         */
         long number(String path, Object node, long def, boolean[] present) {
             if (node == null) {
                 present[0] = false;
                 return def;
             }
             present[0] = true;
+
+            if (node instanceof Double || node instanceof Float) {
+                double d = ((Number) node).doubleValue();
+                if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.rint(d)) {
+                    return reject(path + " must be a whole number, got '" + node + "'", def, present);
+                }
+                if (d < Long.MIN_VALUE || d > Long.MAX_VALUE) {
+                    return reject(path + " is out of range, got '" + node + "'", def, present);
+                }
+                return (long) d;
+            }
+            if (node instanceof java.math.BigInteger bi) {
+                if (bi.bitLength() >= 64) {
+                    return reject(path + " is out of range, got '" + node + "'", def, present);
+                }
+                return bi.longValue();
+            }
+            if (node instanceof java.math.BigDecimal bd) {
+                try {
+                    return bd.longValueExact();
+                } catch (ArithmeticException e) {
+                    return reject(path + " must be a whole number in range, got '" + node + "'",
+                            def, present);
+                }
+            }
             if (node instanceof Number n) {
-                return n.longValue();
+                return n.longValue(); // Byte/Short/Integer/Long — always exact
             }
+
+            String s = String.valueOf(node).trim();
             try {
-                return Long.parseLong(String.valueOf(node).trim());
+                return Long.parseLong(s);
             } catch (NumberFormatException e) {
-                error(path + " must be a number, got '" + node + "'");
-                present[0] = false;
-                return def;
+                // Distinguish "not a number at all" from "a number too big to
+                // hold", because they need different fixes from the operator.
+                try {
+                    new java.math.BigInteger(s);
+                    return reject(path + " is out of range, got '" + s + "'", def, present);
+                } catch (NumberFormatException notNumeric) {
+                    return reject(path + " must be a number, got '" + s + "'", def, present);
+                }
             }
+        }
+
+        private long reject(String message, long def, boolean[] present) {
+            error(message);
+            present[0] = false;
+            return def;
         }
 
         int port(String path, Object node, int def) {
