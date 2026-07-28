@@ -29,8 +29,20 @@ class StreamingGateTest {
     void oneGigabyteUploadStreamsWithoutBufferingIntoHeap() throws Exception {
         MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
 
-        try (ProxyHarness h = ProxyHarness.start(
-                s -> ProxyHarness.withMaxBodyBytes(s, 4L * 1024 * 1024 * 1024));
+        // This test measures heap, so it must not also be a timing test. The
+        // request timeout has to clear the whole transfer, because Junction arms
+        // that timer when the request head goes upstream and only cancels it when
+        // the response head comes back — and a backend cannot answer a 1 GB POST
+        // until it has received all of it. The default 30s therefore sits barely
+        // above the ~21s transfer and flips on ordinary machine variance.
+        //
+        // That coupling is a real design flaw, not just test fragility: it means
+        // "request timeout" is currently a total-transaction timeout, so a slow
+        // client legitimately uploading a large body is killed by a limit meant
+        // to catch a silent backend. Tracked as OPQ-009; fixing it belongs with
+        // the timeout work, not here.
+        try (ProxyHarness h = ProxyHarness.start(s -> ProxyHarness.withRequestTimeout(
+                ProxyHarness.withMaxBodyBytes(s, 4L * 1024 * 1024 * 1024), 10 * 60_000));
              RawHttp c = new RawHttp(h.port())) {
 
             long before = settledHeapUsed(memory);

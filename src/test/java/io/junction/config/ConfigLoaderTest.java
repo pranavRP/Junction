@@ -212,6 +212,128 @@ class ConfigLoaderTest {
     }
 
     @Test
+    void parsesStrategyHealthAndPoolBlocks() {
+        ConfigResult r = parse("""
+                pools:
+                  - name: api
+                    strategy: least_connections
+                    health:
+                      path: /ping
+                      interval_ms: 1000
+                      timeout_ms: 250
+                      healthy_threshold: 4
+                      unhealthy_threshold: 5
+                    pool:
+                      max_idle_per_backend: 8
+                      max_connect_ms: 300
+                      idle_ttl_ms: 15000
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """);
+        assertInstanceOf(ConfigResult.Valid.class, r);
+
+        PoolConfig p = ((ConfigResult.Valid) r).config().pools().get(0);
+        assertEquals(Strategy.LEAST_CONNECTIONS, p.strategy());
+        assertEquals("/ping", p.health().path());
+        assertEquals(250L, p.health().timeoutMs());
+        assertEquals(5, p.health().unhealthyThreshold());
+        assertEquals(8, p.pool().maxIdlePerBackend());
+        assertEquals(15_000L, p.pool().idleTtlMs());
+    }
+
+    @Test
+    void defaultsToP2cWhenStrategyAbsent() {
+        ConfigResult r = parse(VALID);
+        assertInstanceOf(ConfigResult.Valid.class, r);
+        PoolConfig p = ((ConfigResult.Valid) r).config().pools().get(0);
+        assertEquals(Strategy.P2C, p.strategy());
+        assertEquals(HealthConfig.defaults().path(), p.health().path());
+    }
+
+    @Test
+    void rejectsUnknownStrategy() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    strategy: magic
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "not a known strategy: 'magic'");
+    }
+
+    @Test
+    void consistentHashRequiresAWellFormedHashKey() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    strategy: consistent_hash
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "hash_key is required");
+
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    strategy: consistent_hash
+                    hash_key: X-Session-Id
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "must start with 'header:' or 'cookie:'");
+    }
+
+    /** A key that silently does nothing is the same trap as a typo'd key. */
+    @Test
+    void rejectsHashKeyOnAStrategyThatIgnoresIt() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    strategy: round_robin
+                    hash_key: header:X-Session-Id
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "hash_key only applies to strategy 'consistent_hash'");
+    }
+
+    /** Probes that outlive their interval stack up on an already-sick backend. */
+    @Test
+    void rejectsHealthTimeoutNotLessThanInterval() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    health: { interval_ms: 500, timeout_ms: 500 }
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "must be less than interval_ms");
+    }
+
+    @Test
+    void rejectsUnknownKeysInsideHealthAndPoolBlocks() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    health: { intrval_ms: 1000 }
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "unknown key 'intrval_ms'");
+
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    pool: { max_idle: 4 }
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "unknown key 'max_idle'");
+    }
+
+    @Test
     void weightZeroIsAllowedBecauseItMeansDrain() {
         ConfigResult r = parse("""
                 pools:

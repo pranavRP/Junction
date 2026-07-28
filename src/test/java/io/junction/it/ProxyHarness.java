@@ -61,7 +61,7 @@ final class ProxyHarness implements AutoCloseable {
 
         JunctionConfig config = new JunctionConfig(
                 tune.apply(base),
-                List.of(new PoolConfig("api",
+                List.of(PoolConfig.of("api",
                         List.of(new BackendConfig("b1", "127.0.0.1", backend.boundPort(), 100)))),
                 routes);
 

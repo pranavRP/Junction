@@ -16,7 +16,7 @@ java {
 
 dependencies {
     implementation("io.netty:netty-all:4.1.115.Final")
-    implementation("org.yaml:snakeyaml:2.3")
+    implementation("org.yaml:snakeyaml:2.5")
 
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")

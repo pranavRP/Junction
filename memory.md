@@ -372,6 +372,22 @@ many small HttpContent messages, and the one-upstream-connection-per-downstream
 pinning limiting upstream parallelism. *Profile in Phase 4 rather than guessing;
 do not tune anything before then.*
 
+**OPQ-009** — `request_timeout_ms` is really a *total transaction* timeout. The
+timer is armed when the request head goes upstream and cancelled when the
+response head returns, so it spans the entire request-body upload. A client
+legitimately uploading a large body over a slow link is therefore killed by a
+limit that exists to catch a *silent backend*. Surfaced when the 1 GB gate test
+started tripping the 30s default at ~31s (it had passed at 21.2s on a faster
+day) — the test was one machine-variance away from failing all along.
+
+The obvious fix — arm the timer only once the request is fully sent — is not
+sufficient on its own: if the backend stalls *mid-upload*, the upstream write
+buffer fills, backpressure stops downstream reads, and the idle timer is
+suppressed by the guard from SUR-002. Nothing would ever fire and the
+connection would hang indefinitely. A correct design needs a separate stall
+detector (no forward progress for N ms) alongside a response-head timeout.
+*Resolve in the phase that does timeouts properly; do not bolt it on.*
+
 **OPQ-008** — Phase 1 pins exactly one upstream connection per downstream
 connection (DEC-007). This caps upstream concurrency at the downstream
 connection count and makes an idle client hold an idle backend socket. Phase 2's

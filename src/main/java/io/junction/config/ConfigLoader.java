@@ -130,17 +130,106 @@ public final class ConfigLoader {
         for (int i = 0; i < list.size(); i++) {
             String path = "pools[" + i + "]";
             Map<String, Object> m = v.asMap(path, list.get(i));
-            v.rejectUnknownKeys(path, m, Set.of("name", "backends"));
+            v.rejectUnknownKeys(path, m,
+                    Set.of("name", "strategy", "hash_key", "health", "pool", "backends"));
 
             String name = v.nonBlank(path + ".name", m.get("name"));
             if (name != null && !seenPools.add(name)) {
                 v.error(path + ".name duplicates an earlier pool: '" + name + "'");
             }
+
+            Strategy strategy = parseStrategy(v, path, m.get("strategy"));
+            String hashKey = parseHashKey(v, path, m.get("hash_key"), strategy);
+
             out.add(new PoolConfig(
                     name == null ? "<invalid>" : name,
+                    strategy,
+                    hashKey,
+                    parseHealth(v, path, m.get("health")),
+                    parseUpstreamPool(v, path, m.get("pool")),
                     parseBackends(v, path, m.get("backends"))));
         }
         return out;
+    }
+
+    private static Strategy parseStrategy(Validator v, String parent, Object node) {
+        if (node == null) {
+            return Strategy.P2C; // design.md §2.2: the right default
+        }
+        String s = String.valueOf(node).trim();
+        return Strategy.fromKey(s).orElseGet(() -> {
+            v.error(parent + ".strategy is not a known strategy: '" + s
+                    + "' (known: " + Strategy.knownKeys() + ")");
+            return Strategy.P2C;
+        });
+    }
+
+    /**
+     * A hash key means nothing to any strategy but consistent hashing, so its
+     * presence elsewhere is rejected rather than ignored — same reasoning as
+     * unknown keys: config that silently does nothing is a trap.
+     */
+    private static String parseHashKey(Validator v, String parent, Object node, Strategy strategy) {
+        if (strategy == Strategy.CONSISTENT_HASH) {
+            String key = v.nonBlank(parent + ".hash_key", node);
+            if (key == null) {
+                return "";
+            }
+            if (!key.startsWith("header:") && !key.startsWith("cookie:")) {
+                v.error(parent + ".hash_key must start with 'header:' or 'cookie:', got '" + key + "'");
+            }
+            return key;
+        }
+        if (node != null) {
+            v.error(parent + ".hash_key only applies to strategy '"
+                    + Strategy.CONSISTENT_HASH.key() + "', but strategy is '"
+                    + strategy.key() + "'");
+        }
+        return "";
+    }
+
+    private static HealthConfig parseHealth(Validator v, String parent, Object node) {
+        HealthConfig d = HealthConfig.defaults();
+        if (node == null) {
+            return d;
+        }
+        String path = parent + ".health";
+        Map<String, Object> m = v.asMap(path, node);
+        v.rejectUnknownKeys(path, m, Set.of(
+                "path", "interval_ms", "timeout_ms", "healthy_threshold", "unhealthy_threshold"));
+
+        String probePath = orDefault(v.nonBlankOrNull(path + ".path", m.get("path")), d.path());
+        if (!probePath.startsWith("/")) {
+            v.error(path + ".path must start with '/', got '" + probePath + "'");
+        }
+        long interval = v.positiveLong(path + ".interval_ms", m.get("interval_ms"), d.intervalMs());
+        long timeout = v.positiveLong(path + ".timeout_ms", m.get("timeout_ms"), d.timeoutMs());
+        // A probe that can outlive its own interval stacks probes on a backend
+        // that is already struggling — the last thing a sick backend needs.
+        if (timeout >= interval) {
+            v.error(path + ".timeout_ms (" + timeout + ") must be less than interval_ms ("
+                    + interval + "), or probes overlap");
+        }
+        return new HealthConfig(
+                probePath,
+                interval,
+                timeout,
+                v.positiveInt(path + ".healthy_threshold", m.get("healthy_threshold"), d.healthyThreshold()),
+                v.positiveInt(path + ".unhealthy_threshold", m.get("unhealthy_threshold"), d.unhealthyThreshold()));
+    }
+
+    private static UpstreamPoolConfig parseUpstreamPool(Validator v, String parent, Object node) {
+        UpstreamPoolConfig d = UpstreamPoolConfig.defaults();
+        if (node == null) {
+            return d;
+        }
+        String path = parent + ".pool";
+        Map<String, Object> m = v.asMap(path, node);
+        v.rejectUnknownKeys(path, m, Set.of("max_idle_per_backend", "max_connect_ms", "idle_ttl_ms"));
+        return new UpstreamPoolConfig(
+                v.positiveInt(path + ".max_idle_per_backend", m.get("max_idle_per_backend"), d.maxIdlePerBackend()),
+                v.positiveLong(path + ".max_connect_ms", m.get("max_connect_ms"), d.maxConnectMs()),
+                v.positiveLong(path + ".idle_ttl_ms", m.get("idle_ttl_ms"), d.idleTtlMs()));
     }
 
     private static List<BackendConfig> parseBackends(Validator v, String parent, Object node) {
@@ -258,6 +347,18 @@ public final class ConfigLoader {
                             + "' (known: " + String.join(", ", new java.util.TreeSet<>(known)) + ")");
                 }
             }
+        }
+
+        /**
+         * Like {@link #nonBlank} but absence is allowed — for keys that have a
+         * defensible default. A present-but-blank value is still an error, since
+         * that is a half-finished edit rather than a deliberate omission.
+         */
+        String nonBlankOrNull(String path, Object node) {
+            if (node == null) {
+                return null;
+            }
+            return nonBlank(path, node);
         }
 
         String nonBlank(String path, Object node) {
