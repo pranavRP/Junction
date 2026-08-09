@@ -3,45 +3,71 @@ package io.junction.http;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.util.ReferenceCountUtil;
 
 /**
- * Upstream tail of the pipeline. Deliberately holds no state and makes no
- * decisions: it forwards every event to {@link ProxyFrontendHandler}, which owns
- * the whole request lifecycle.
+ * Upstream tail of the pipeline. Holds no request state and makes no decisions:
+ * every event is forwarded to the {@link ProxyFrontendHandler} that currently
+ * owns this connection.
  *
- * <p>Keeping all state in one handler is what makes R-3 easy to satisfy — there
- * is exactly one object holding request state, touched by exactly one EventLoop
- * (R-4), so no field here needs to be volatile or guarded.
+ * <p><b>Attach/detach exists because connections outlive requests.</b> A pooled
+ * channel is reused by whichever downstream connection acquires it next, so the
+ * owner is set on acquire and cleared on release. Both happen on the channel's
+ * own EventLoop (R-4), so the fields need no synchronisation despite changing
+ * over the channel's life.
  */
 final class ProxyBackendHandler extends ChannelInboundHandlerAdapter {
 
-    private final ProxyFrontendHandler front;
-    private final Channel downstream;
+    private ProxyFrontendHandler front;
+    private Channel downstream;
 
-    ProxyBackendHandler(ProxyFrontendHandler front, Channel downstream) {
+    void attach(ProxyFrontendHandler front, Channel downstream) {
         this.front = front;
         this.downstream = downstream;
     }
 
+    void detach() {
+        this.front = null;
+        this.downstream = null;
+    }
+
+    boolean isAttached() {
+        return front != null;
+    }
+
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        if (front == null) {
+            // Data on an idle pooled connection: the backend is out of sync with
+            // us, so this connection can never be trusted to frame correctly
+            // again. Drop it rather than hand it to the next request.
+            ReferenceCountUtil.release(msg);
+            ctx.close();
+            return;
+        }
         front.onUpstreamMessage(ctx, msg, downstream);
     }
 
     @Override
     public void channelWritabilityChanged(ChannelHandlerContext ctx) {
-        front.onUpstreamWritabilityChanged(downstream, ctx.channel().isWritable());
+        if (front != null) {
+            front.onUpstreamWritabilityChanged(downstream, ctx.channel().isWritable());
+        }
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        front.onUpstreamInactive(downstream);
+        if (front != null) {
+            front.onUpstreamInactive(downstream);
+        }
         ctx.fireChannelInactive();
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        front.onUpstreamError(downstream, cause);
+        if (front != null) {
+            front.onUpstreamError(downstream, cause);
+        }
         ctx.close();
     }
 }

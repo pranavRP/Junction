@@ -2,30 +2,33 @@ package io.junction.it;
 
 import io.junction.chaos.ChaosBackend;
 import io.junction.config.BackendConfig;
+import io.junction.config.HealthConfig;
 import io.junction.config.JunctionConfig;
 import io.junction.config.PoolConfig;
 import io.junction.config.RouteConfig;
 import io.junction.config.ServerConfig;
+import io.junction.config.Strategy;
+import io.junction.config.UpstreamPoolConfig;
 import io.junction.net.JunctionServer;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.UnaryOperator;
 
 /**
- * Starts a real ChaosBackend and a real JunctionServer on ephemeral ports.
+ * Starts real ChaosBackends and a real JunctionServer on ephemeral ports.
  *
- * <p>Real sockets on purpose (R-20): the behaviours Phase 1 claims — streaming,
- * framing, keep-alive, timeouts — only exist at the socket layer. An
- * EmbeddedChannel test would assert the shape of the code rather than the
- * behaviour of the proxy.
+ * <p>Real sockets on purpose (R-20): streaming, framing, keep-alive, pooling and
+ * timeouts only exist at the socket layer. An EmbeddedChannel test would assert
+ * the shape of the code rather than the behaviour of the proxy.
  */
 final class ProxyHarness implements AutoCloseable {
 
-    private final ChaosBackend backend;
+    private final List<ChaosBackend> backends;
     private final JunctionServer server;
 
-    private ProxyHarness(ChaosBackend backend, JunctionServer server) {
-        this.backend = backend;
+    private ProxyHarness(List<ChaosBackend> backends, JunctionServer server) {
+        this.backends = backends;
         this.server = server;
     }
 
@@ -33,19 +36,32 @@ final class ProxyHarness implements AutoCloseable {
         return start(UnaryOperator.identity());
     }
 
-    /** @param tune adjusts the default server config, e.g. to shrink a limit */
     static ProxyHarness start(UnaryOperator<ServerConfig> tune) throws Exception {
-        return start(tune, List.of(new RouteConfig("*", "/", "api")));
+        return start(tune, List.of(new RouteConfig("*", "/", "api")), 1, Strategy.P2C);
     }
 
     static ProxyHarness startWithRoutes(List<RouteConfig> routes) throws Exception {
-        return start(UnaryOperator.identity(), routes);
+        return start(UnaryOperator.identity(), routes, 1, Strategy.P2C);
     }
 
-    static ProxyHarness start(UnaryOperator<ServerConfig> tune, List<RouteConfig> routes)
-            throws Exception {
-        ChaosBackend backend = new ChaosBackend(0, "b1");
-        backend.start();
+    /** Multi-backend harness for balancing and ejection tests. */
+    static ProxyHarness startWithBackends(int backendCount, Strategy strategy) throws Exception {
+        return start(UnaryOperator.identity(),
+                List.of(new RouteConfig("*", "/", "api")), backendCount, strategy);
+    }
+
+    static ProxyHarness start(UnaryOperator<ServerConfig> tune,
+                              List<RouteConfig> routes,
+                              int backendCount,
+                              Strategy strategy) throws Exception {
+        List<ChaosBackend> started = new ArrayList<>();
+        List<BackendConfig> configs = new ArrayList<>();
+        for (int i = 0; i < backendCount; i++) {
+            ChaosBackend b = new ChaosBackend(0, "b" + i);
+            b.start();
+            started.add(b);
+            configs.add(new BackendConfig("b" + i, "127.0.0.1", b.boundPort(), 100));
+        }
 
         ServerConfig base = new ServerConfig(
                 0,                       // ephemeral: boundPort() reports the real one
@@ -59,15 +75,18 @@ final class ProxyHarness implements AutoCloseable {
                 30_000,                  // request -> 504
                 1_000);                  // connect -> 502
 
+        // Fast probes so ejection tests do not wait on a production interval.
+        HealthConfig health = new HealthConfig("/healthz", 200, 100, 2, 2);
+
         JunctionConfig config = new JunctionConfig(
                 tune.apply(base),
-                List.of(PoolConfig.of("api",
-                        List.of(new BackendConfig("b1", "127.0.0.1", backend.boundPort(), 100)))),
+                List.of(new PoolConfig("api", strategy, "",
+                        health, UpstreamPoolConfig.defaults(), configs)),
                 routes);
 
         JunctionServer server = new JunctionServer(config);
         server.start();
-        return new ProxyHarness(backend, server);
+        return new ProxyHarness(started, server);
     }
 
     // Records have no wither syntax, so these keep the tests readable at the
@@ -107,8 +126,16 @@ final class ProxyHarness implements AutoCloseable {
         return server.boundPort();
     }
 
+    JunctionServer server() {
+        return server;
+    }
+
+    ChaosBackend backend(int index) {
+        return backends.get(index);
+    }
+
     int backendPort() {
-        return backend.boundPort();
+        return backends.get(0).boundPort();
     }
 
     String baseUrl() {
@@ -118,6 +145,6 @@ final class ProxyHarness implements AutoCloseable {
     @Override
     public void close() {
         server.stop();
-        backend.stop();
+        backends.forEach(ChaosBackend::stop);
     }
 }

@@ -21,8 +21,8 @@ class ProxyIntegrationTest {
             RawHttp.Response r = c.readResponse();
 
             assertEquals(200, r.status());
-            assertEquals("b1", r.headers().get("X-Backend-Id"));
-            assertTrue(r.bodyText().startsWith("ok from b1"), r.bodyText());
+            assertEquals("b0", r.headers().get("X-Backend-Id"));
+            assertTrue(r.bodyText().startsWith("ok from b0"), r.bodyText());
         }
     }
 
