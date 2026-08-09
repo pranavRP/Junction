@@ -55,6 +55,13 @@ public final class ChaosBackend {
 
     private final int port;
     private final String id;
+    /**
+     * Whole-instance health. Flipping this to false makes every response a 503,
+     * which is what "this backend is broken" looks like to both a health probe
+     * and a real request — the scenario the Phase 2 ejection gate exercises.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean healthy =
+            new java.util.concurrent.atomic.AtomicBoolean(true);
     private EventLoopGroup boss;
     private EventLoopGroup workers;
     private Channel channel;
@@ -62,6 +69,15 @@ public final class ChaosBackend {
     public ChaosBackend(int port, String id) {
         this.port = port;
         this.id = id;
+    }
+
+    /** In-process control for tests; containers use {@code /_chaos/unhealthy}. */
+    public void setHealthy(boolean value) {
+        healthy.set(value);
+    }
+
+    public boolean isHealthy() {
+        return healthy.get();
     }
 
     public static void main(String[] args) throws Exception {
@@ -83,7 +99,7 @@ public final class ChaosBackend {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ch.pipeline().addLast(new HttpServerCodec());
-                        ch.pipeline().addLast(new Handler(id));
+                        ch.pipeline().addLast(new Handler(id, healthy));
                     }
                 });
         channel = b.bind(new InetSocketAddress(port)).sync().channel();
@@ -114,6 +130,8 @@ public final class ChaosBackend {
     static final class Handler extends ChannelInboundHandlerAdapter {
 
         private final String id;
+        private final java.util.concurrent.atomic.AtomicBoolean healthy;
+        private String uri = "/";
         private long delayMs;
         private int status = 200;
         private int size = -1;
@@ -129,13 +147,15 @@ public final class ChaosBackend {
          */
         private int requestsOnConnection;
 
-        Handler(String id) {
+        Handler(String id, java.util.concurrent.atomic.AtomicBoolean healthy) {
             this.id = id;
+            this.healthy = healthy;
         }
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             if (msg instanceof HttpRequest req) {
+                uri = req.uri();
                 delayMs = header(req, "X-Chaos-Delay", 0);
                 status = (int) header(req, "X-Chaos-Status", 200);
                 size = (int) header(req, "X-Chaos-Size", -1);
@@ -165,7 +185,24 @@ public final class ChaosBackend {
             if (!ctx.channel().isActive()) {
                 return;
             }
-            HttpResponseStatus st = HttpResponseStatus.valueOf(status);
+
+            // Control endpoints flip whole-instance behaviour without a redeploy,
+            // so a container can be broken and repaired mid-load-test.
+            if (uri.startsWith("/_chaos/healthy")) {
+                healthy.set(true);
+                sendPlain(ctx, HttpResponseStatus.OK, "healthy\n");
+                return;
+            }
+            if (uri.startsWith("/_chaos/unhealthy")) {
+                healthy.set(false);
+                sendPlain(ctx, HttpResponseStatus.OK, "unhealthy\n");
+                return;
+            }
+
+            // A broken instance fails everything, probes and real traffic alike.
+            HttpResponseStatus st = healthy.get()
+                    ? HttpResponseStatus.valueOf(status)
+                    : HttpResponseStatus.SERVICE_UNAVAILABLE;
 
             if (drop) {
                 // Half-written response: head only, then a hard close.
@@ -208,6 +245,16 @@ public final class ChaosBackend {
                 ctx.write(new DefaultHttpContent(buf));
             }
             finish(ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT), ctx);
+        }
+
+        private void sendPlain(ChannelHandlerContext ctx, HttpResponseStatus st, String text) {
+            byte[] body = text.getBytes(CharsetUtil.UTF_8);
+            FullHttpResponse resp = new DefaultFullHttpResponse(
+                    HttpVersion.HTTP_1_1, st, Unpooled.wrappedBuffer(body));
+            resp.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; charset=utf-8");
+            resp.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length);
+            resp.headers().set("X-Backend-Id", id);
+            finish(ctx.writeAndFlush(resp), ctx);
         }
 
         private void finish(ChannelFuture f, ChannelHandlerContext ctx) {
