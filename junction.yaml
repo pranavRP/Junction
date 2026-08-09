@@ -15,8 +15,26 @@ server:
 
 pools:
   - name: api
+    # p2c: near-optimal spread at O(1) with no shared state, and no herd
+    # (see design.md §2.2). round_robin | least_connections | consistent_hash
+    # are the alternatives; consistent_hash additionally needs hash_key.
+    strategy: p2c
+    health:
+      path: /healthz
+      interval_ms: 2000
+      timeout_ms: 500         # must stay under interval_ms or probes stack up
+      healthy_threshold: 2    # slow to trust
+      unhealthy_threshold: 3  # slow to eject
+    pool:
+      max_idle_per_backend: 64
+      max_connect_ms: 1000
+      # Must be shorter than the backend's own keep-alive timeout, or the pool
+      # hands out sockets the backend has already discarded.
+      idle_ttl_ms: 30000
     backends:
       - { id: b1, host: backend-1, port: 8000, weight: 100 }
+      - { id: b2, host: backend-2, port: 8000, weight: 100 }
+      - { id: b3, host: backend-3, port: 8000, weight: 100 }
 
 routes:
   - { host: "*", prefix: "/", pool: api }

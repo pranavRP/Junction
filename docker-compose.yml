@@ -1,11 +1,14 @@
 name: junction
 
-# Phase 1 topology: the real proxy in front of one chaos backend.
-# `wrk` is behind the `load` profile so `docker compose up` stays lightweight;
-# run tools/bench/phase0-baseline.sh to produce the throughput numbers.
+# Phase 2 topology: the proxy in front of a three-backend pool with active
+# health checking. Break one with:
+#   docker compose exec backend-2 sh -c 'wget -qO- localhost:8000/_chaos/unhealthy'
+# and watch traffic drain off it within a couple of probe intervals.
+#
+# `wrk` is behind the `load` profile so `docker compose up` stays lightweight.
 
 services:
-  backend-1:
+  backend-1: &backend
     build: .
     image: junction:latest
     environment:
@@ -15,11 +18,27 @@ services:
     expose:
       - "8000"
 
+  backend-2:
+    <<: *backend
+    environment:
+      MAIN: io.junction.chaos.ChaosBackend
+      BACKEND_PORT: "8000"
+      BACKEND_ID: backend-2
+
+  backend-3:
+    <<: *backend
+    environment:
+      MAIN: io.junction.chaos.ChaosBackend
+      BACKEND_PORT: "8000"
+      BACKEND_ID: backend-3
+
   junction:
     build: .
     image: junction:latest
     depends_on:
       - backend-1
+      - backend-2
+      - backend-3
     environment:
       MAIN: io.junction.Junction
       JUNCTION_CONFIG: /app/junction.yaml

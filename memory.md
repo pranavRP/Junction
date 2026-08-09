@@ -144,6 +144,56 @@ deliberate — it is what makes the typo check work.
 
 ---
 
+### DEC-009 — Smooth weighted round robin as a precomputed schedule
+*Date: 2026-08-09 · Status: Accepted · supersedes the approach in design.md §2.1*
+
+**Context.** design.md carries nginx's per-backend `current` counters, mutated on
+every pick. Those counters are shared across event loops, so the pseudocode is a
+data race. design.md itself offers only "a striped counter or accept the
+imprecision and document it".
+
+**Decision.** Generate the identical smooth sequence once at construction and
+index it with a single atomic counter. Weights are reduced by their GCD first, so
+{100,100,100} costs three slots rather than three hundred.
+
+**Why.** It produces exactly the same order, but selection becomes an array read
+behind one atomic increment: no lock (R-3 bans them on the data path), no
+allocation, no imprecision to document. The schedule depends only on the weights,
+which are immutable for a config generation — the property that makes this work.
+
+**Cost.** Schedule length is the sum of reduced weights, so pathological weights
+like {997, 991} would allocate a large int array once. Acceptable, and bounded by
+config validation capping weight at 1000.
+
+---
+
+### DEC-010 — Balancers take an extracted string, never an HTTP request
+*Date: 2026-08-09 · Status: Accepted*
+
+**Decision.** `Balancer.pick(String hashKey)`. Header and cookie extraction lives
+in `io.junction.http`; `io.junction.balance` never sees a Netty type.
+
+**Why.** R-11 forbids depending upward, and `http` sits above `balance`. The
+practical payoff is that every strategy — including consistent hashing — is unit
+tested with plain strings and no socket, which is why the 100,000-key MEA-003
+measurement runs in milliseconds as an ordinary test.
+
+---
+
+### DEC-011 — Backends start Healthy, and weight 0 is a state-machine event
+*Date: 2026-08-09 · Status: Accepted*
+
+**Decision.** A newly constructed backend is `Healthy`. A backend configured with
+weight 0 is put into `Draining` by applying a `DrainRequested` event at
+construction, not by special-casing weight at each selection site.
+
+**Why.** Starting `Unhealthy` would blackhole all traffic for a full probe
+interval on every deploy. And routing weight 0 through the state machine means
+"why is this backend not receiving traffic" has exactly one place to look, rather
+than a health check in the balancer plus a weight check somewhere else.
+
+---
+
 ## Measurements
 
 *Populate as you go. Every entry needs: what was measured, the exact command,
@@ -198,7 +248,56 @@ this; connection pooling (Phase 2) the rest. If it does not, the hypothesis was
 wrong and that becomes a failure-analysis entry — which is the more interesting
 outcome.
 
-### MEA-003 — Consistent-hash rebalance fraction
+### MEA-003 — Consistent-hash rebalance fraction  *(Phase 2, done)*
+```
+Date:       2026-08-09
+Command:    ./gradlew test --tests '*ConsistentHashBalancerTest*'
+Setup:      5 backends, 160 vnodes each, 100,000 keys, remove 1 backend
+Prediction (written BEFORE measuring): 20.00%  (= 1/N)
+Measured:   19.73% remapped
+            0.00% moved off a surviving backend
+```
+**Explanation of the gap.** 0.27pp under prediction, and the direction is the
+informative part: the removed backend simply owned slightly less than a perfect
+fifth of the ring. With 160 vnodes over 5 backends the arcs are uneven by a few
+tenths of a percent, so its share was 19.73% rather than 20%. Every one of those
+keys moved, and *nothing else did* — the 0.00% figure is the actual guarantee
+being tested. A modulo scheme would have remapped roughly 80% here.
+
+Raising vnodes would tighten the spread toward 20% at the cost of a larger ring
+and slower construction. 160 is the standard figure and 0.27pp is not worth
+paying to remove.
+
+### MEA-012 — Backend ejection latency (the Phase 2 gate)
+```
+Date:      2026-08-09
+Command:   ./gradlew test --tests '*BalancingIntegrationTest*'
+Setup:     3 backends, p2c, health probe 200ms / unhealthy_threshold 2,
+           one backend broken mid-load
+Gate:      client error rate back to 0 within 10,000 ms
+Measured:  76 client errors, error rate back to zero after 513 ms
+```
+513ms against a 10s gate — a 19x margin. It lands where the config predicts:
+2 failed probes at 200ms intervals is ~400ms of detection, plus a partial
+interval of slack. The 76 errors are requests already routed to the broken
+backend before it was ejected; passive outlier detection (Phase 3) is what
+shrinks that number, since active probing cannot react faster than its interval.
+
+Verified again end-to-end under Docker with three real containers: breaking
+backend-2 gave 13 errors in 200 requests, after which it received none, and
+re-enabling it returned it to rotation within ~2 polling rounds.
+
+### MEA-013 — Pooled upstream connection reuse across client connections
+```
+Date:      2026-08-09
+Setup:     1 backend, 120 sequential fresh client connections, 1 request each
+Measured:  96 of 120 (80%) inherited an already-open upstream socket
+           max observed reuse depth: 5 requests on one upstream connection
+```
+Not 100%, and that is the design rather than a defect: pools are partitioned per
+EventLoop, so a client can only inherit a socket left on the loop it happened to
+land on. Netty assigns loops round-robin across ~2x cores, so the miss rate is
+roughly the chance of landing on a cold loop. Directly relevant to OPQ-002.
 ### MEA-004 — P2C vs. least-connections in-flight variance
 ### MEA-005 — Retry amplification under total backend outage
 ### MEA-006 — The knee: throughput and p99 vs. offered load
@@ -372,6 +471,19 @@ many small HttpContent messages, and the one-upstream-connection-per-downstream
 pinning limiting upstream parallelism. *Profile in Phase 4 rather than guessing;
 do not tune anything before then.*
 
+**OPQ-010** — The repo lives under `C:\Users\prana\OneDrive\...`, and OneDrive
+Files-On-Demand turns untouched files into reparse-point placeholders. Docker's
+BuildKit cannot read them: `docker build` failed with
+`invalid file request Dockerfile` while reporting `transferring dockerfile: 31B`
+for a 1009-byte file. Confirmed by copying the identical context outside OneDrive,
+where it built first try. `attrib +P -U` did not clear it.
+
+Nothing to do with the code, but it breaks the headline
+`docker compose up` claim on a machine that has synced the repo and not touched
+it recently — i.e. exactly the "clean machine" case in the success metrics.
+*Resolve by moving the working copy off OneDrive before Phase 6, or the demo
+fails for the one audience it exists for.*
+
 **OPQ-009** — `request_timeout_ms` is really a *total transaction* timeout. The
 timer is armed when the request head goes upstream and cancelled when the
 response head returns, so it spans the entire request-body upload. A client
@@ -449,6 +561,55 @@ Numbers: MEA-011 — 14,134 RPS median / p99 27.1ms through Junction vs 39,543 /
          NFR-2 explicitly NOT measured (needs a 50%-of-capacity run).
 
 Stopped at: Phase 1 complete, all gate criteria green, committed.
+
+### 2026-08-09 — Phase 2 (Pools, balancing, health)
+Did:     PHASE 2 GATE GREEN. Built the whole phase across backend / balance /
+         pool and wired it into the data path:
+          - config: strategy, hash_key, health block, upstream pool block, with
+            validation that rejects a hash_key on a strategy that ignores it and
+            a probe timeout that is not under its interval (DEC-008 style)
+          - health state machine: 4 sealed states x 4 sealed events, exhaustive
+            16-cell table test plus a guard asserting the table is complete
+            (R-21), injected Clock (R-24). SlowStart deliberately omitted until
+            Phase 3 implements the ramp
+          - balancing: smooth weighted RR as a precomputed lock-free schedule
+            (DEC-009), least-connections, p2c, and consistent hashing with
+            bounded loads. Strategies take an extracted string, never a request
+            (DEC-010)
+          - active health checker on a dedicated executor, jittered per backend
+          - per-EventLoop LIFO upstream connection pool with idle TTL, max idle,
+            and close-eviction of pooled sockets
+          - ProxyFrontendHandler now routes -> balances -> acquires -> releases,
+            retiring the DEC-007 one-upstream-per-downstream pinning
+         157 tests green, zero Netty leaks at PARANOID. Also verified the whole
+         lifecycle under Docker with 3 real backend containers: break one, watch
+         it leave rotation, repair it, watch it return.
+
+Numbers: MEA-012 (gate) — backend killed, client error rate back to zero in
+         513ms against a 10s gate. 76 errors during the window.
+         MEA-003 — 19.73% of 100k keys remapped when 1 of 5 backends leaves,
+         against a 20.00% prediction written first; 0.00% moved off surviving
+         backends, which is the actual guarantee.
+         MEA-013 — 80% of fresh client connections inherited a pooled upstream
+         socket; the other 20% is per-EventLoop partitioning, not a defect.
+
+Surprises: no new SUR entries. Two test failures during the phase were both my
+         tests being wrong rather than the code: smooth WRR at {5,1,1} really
+         does emit a run of 4 across the period boundary (so the weight set was
+         a poor demonstration, switched to {5,5,1}), and least-connections
+         really does return the first of three equally idle backends every time.
+         Recording that they were test bugs matters — "fixed the test" is only
+         honest when the code was verified right first.
+         OPQ-010 opened: OneDrive placeholders break docker build entirely.
+
+Stopped at: Phase 2 complete, all gate criteria green, handed over for commit.
+Next:    Phase 3 — circuit breaker with bounded half-open probes and exponential
+         cooldown, passive outlier ejection, slow start on re-admission (which
+         inserts SlowStart into the sealed health state and will not compile
+         until every switch handles it, by design), retry budget, panic mode.
+         The retry-amplification test is the single most PE-relevant test in the
+         repo. Carry in: OPQ-007 (unprofiled 2.8x penalty — do not tune before
+         profiling), OPQ-009 (timeout spans the upload), OPQ-010 (OneDrive).
 Next:    Phase 2 — BackendPool + health state machine (table-driven exhaustive
          test, R-21), balancing strategies (RR / least-conn / P2C / consistent
          hash), active health checker on the control-plane executor, and the
