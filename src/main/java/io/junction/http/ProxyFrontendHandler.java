@@ -46,6 +46,16 @@ import java.util.concurrent.TimeUnit;
  * request and returned when the response completes, so an idle client no longer
  * holds a backend socket hostage and upstream concurrency is no longer capped by
  * the downstream connection count.
+ *
+ * <p><b>Retries are confined to the connect failure (FR-3.4).</b> That is not
+ * timidity, it is the only point in a streaming proxy where a retry is honest:
+ * the request head is still sitting in the inbox and not one byte has gone
+ * upstream, so re-picking a backend is genuinely a first attempt. Retrying once
+ * the body has begun to stream would need the body buffered to replay it, which
+ * is the exact design this proxy exists to avoid, and retrying once response
+ * bytes have reached the client is not a retry at all. Every retry also has to
+ * buy a token from the pool's {@link io.junction.backend.RetryBudget}, so a total
+ * outage cannot turn one failing request into an unbounded storm.
  */
 public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
 
@@ -61,8 +71,11 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
 
     private Channel upstream;
     private BackendRuntime backend;
+    private BackendPool pool;
     private UpstreamPool connectionPool;
     private boolean acquiring;
+    /** Attempts made for the request currently at the head of the inbox. */
+    private int attempt;
 
     private boolean awaitingResponse;
     private boolean shortCircuited;
@@ -149,16 +162,25 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
             fail(ctx, HttpResponseStatus.NOT_FOUND, "no_route");
             return false;
         }
-        BackendPool pool = context.pools().byName(matched.pool()).orElse(null);
-        if (pool == null) {
+        BackendPool target = context.pools().byName(matched.pool()).orElse(null);
+        if (target == null) {
             fail(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, "unknown_pool");
             return false;
         }
+        pool = target;
+        if (attempt == 0) {
+            // The denominator of the retry budget. Counted once per client
+            // request, so the ratio it enforces is retries per request rather
+            // than retries per attempt, which would compound.
+            pool.retryBudget().recordRequest();
+        }
+        attempt++;
 
         PickResult pick = pool.pick(HashKeys.extract(req, pool.config().hashKey()));
         if (!(pick instanceof PickResult.Chosen chosen)) {
             // R-7: no live backend is a defined outcome with its own status and
-            // reason, not an exception. Panic mode (FR-3.6) lands in Phase 3.
+            // reason, not an exception. Reachable only with panic disabled — a
+            // pool in panic answers with a backend rather than with this.
             String reason = ((PickResult.NoneAvailable) pick).reason();
             drainInboxUpTo(LastHttpContent.class);
             fail(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, reason);
@@ -193,7 +215,14 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
                 pump(ctx);
                 resumeReads(ctx);
             } else {
+                // A refused or timed-out connect is the clearest passive failure
+                // signal there is: no ambiguity about whether the backend saw the
+                // request, because it never got one.
+                recordOutcome(false);
                 releaseInflight();
+                if (retryConnect(ctx)) {
+                    return;
+                }
                 drainInbox();
                 fail(ctx, HttpResponseStatus.BAD_GATEWAY, "connect_failure");
             }
@@ -201,7 +230,30 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         return false;
     }
 
+    /**
+     * Tries the request again on another backend, if the policy and the budget
+     * both allow it. Safe only here: the head is still in the inbox and nothing
+     * has been written upstream, so nothing is being replayed.
+     */
+    private boolean retryConnect(ChannelHandlerContext ctx) {
+        // The head must still be an unsent request. Anything else means bytes
+        // have already moved and a retry would be a replay, not a retry.
+        if (pool == null || !(inbox.peekFirst() instanceof HttpRequest)) {
+            return false;
+        }
+        if (attempt >= pool.config().retry().maxAttempts()) {
+            return false;
+        }
+        if (!pool.retryBudget().tryRetry()) {
+            return false;
+        }
+        pump(ctx);
+        resumeReads(ctx);
+        return true;
+    }
+
     private void startRequest(ChannelHandlerContext ctx, HttpRequest req) {
+        attempt = 0;   // this request is committed upstream; the next starts fresh
         requestBodyBytes = 0;
         shortCircuited = false;
         upstreamReusable = true;
@@ -271,6 +323,11 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
     void onUpstreamMessage(ChannelHandlerContext upstreamCtx, Object msg, Channel downstream) {
         if (msg instanceof HttpResponse resp) {
             cancelRequestTimeout();
+            // 5xx is the backend reporting its own failure, so it feeds the
+            // breaker. 4xx does not: a client sending a bad request is no
+            // evidence that this backend is unwell, and counting it would let a
+            // scan for /wp-admin eject a perfectly healthy pool.
+            recordOutcome(resp.status().code() < 500);
             // Read the backend's intent before the rewrite strips Connection.
             upstreamReusable = HttpUtil.isKeepAlive(resp);
             HeaderRewriter.forResponse(resp, downstreamKeepAlive, requestId);
@@ -325,6 +382,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         if (awaitingResponse) {
             awaitingResponse = false;
             cancelRequestTimeout();
+            recordOutcome(false);
             releaseInflight();
             drainInbox();
             // Response bytes may already be downstream; a partial body cannot be
@@ -344,6 +402,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         if (awaitingResponse) {
             awaitingResponse = false;
             cancelRequestTimeout();
+            recordOutcome(false);
             releaseInflight();
             drainInbox();
             Responses.sendAndClose(downstream, HttpResponseStatus.BAD_GATEWAY, "upstream_error");
@@ -381,6 +440,22 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         return backend == null ? "" : backend.id();
     }
 
+    /**
+     * Feeds one request outcome to the chosen backend's breaker. Never clears
+     * {@code backend} — {@link #releaseInflight()} owns that, and recording an
+     * outcome must not double as releasing the permit.
+     */
+    private void recordOutcome(boolean ok) {
+        if (backend == null) {
+            return;
+        }
+        if (ok) {
+            backend.recordSuccess();
+        } else {
+            backend.recordFailure();
+        }
+    }
+
     /** R-6: the in-flight permit is released on every path, exactly once. */
     private void releaseInflight() {
         if (backend != null) {
@@ -396,6 +471,9 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         requestTimeout = ctx.executor().schedule(() -> {
             upstreamReusable = false;   // a backend mid-answer cannot be reused
             awaitingResponse = false;
+            // A silent backend is exactly the outlier active probes are slowest
+            // to catch: /healthz can keep answering while real requests hang.
+            recordOutcome(false);
             finishRequest();
             drainInbox();
             Responses.sendAndClose(ctx.channel(), HttpResponseStatus.GATEWAY_TIMEOUT, "request_timeout");
@@ -431,6 +509,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
 
     private void fail(ChannelHandlerContext ctx, HttpResponseStatus status, String reason) {
         cancelRequestTimeout();
+        attempt = 0;
         awaitingResponse = false;
         shortCircuited = true;
         Responses.sendAndClose(ctx.channel(), status, reason);
