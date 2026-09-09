@@ -9,8 +9,12 @@ import io.junction.backend.BackendRuntime;
  * client-visible 503 that needs a reason label for metrics (R-33), not a
  * NullPointerException three frames later.
  *
- * <p>{@code PanicMode} — routing to unhealthy backends when the whole pool is
- * down (FR-3.6) — is a Phase 3 variant and is absent until it works.
+ * <p><b>Panic mode is deliberately not a variant here.</b> Phase 3 planned one,
+ * then found the better shape: panic changes which backends are <em>selectable</em>,
+ * not what a pick <em>returns</em>. Expressing it as a flag the pool sets before
+ * delegating means all four strategies work unchanged in panic and keep their own
+ * behaviour while in it. A PanicMode result would have forced every caller to
+ * handle a third case that behaves exactly like {@link Chosen}.
  */
 public sealed interface PickResult {
 

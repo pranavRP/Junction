@@ -17,17 +17,30 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class HealthTrackerTest {
 
     private static final long T0 = 1_000_000L;
+    /** Long enough that the ramp is never complete unless a test advances the clock. */
+    private static final long RAMP_MS = 10_000L;
 
     private static MutableClock clock() {
         return new MutableClock(T0);
     }
 
-    /** Thresholds of 1 so a single probe flips state and the table stays readable. */
+    /**
+     * Thresholds of 1 so a single probe flips state and the table stays readable.
+     *
+     * <p>Only the slow-start rows configure a ramp. Every other row must see the
+     * ramp-free behaviour, or the {@code unhealthy + ok -> healthy} row would
+     * quietly start asserting slow start instead.
+     */
     private static HealthTracker trackerAt(HealthState target, MutableClock clock) {
-        HealthTracker t = new HealthTracker(1, 1, clock);
+        boolean ramping = target.label().equals("slow_start");
+        HealthTracker t = new HealthTracker(1, 1, ramping ? RAMP_MS : 0L, clock);
         switch (target.label()) {
             case "healthy" -> { /* initial state */ }
             case "unhealthy" -> t.apply(new HealthEvent.ProbeFailed("seed"));
+            case "slow_start" -> {
+                t.apply(new HealthEvent.ProbeFailed("seed"));
+                t.apply(new HealthEvent.ProbeSucceeded());
+            }
             case "draining" -> t.apply(new HealthEvent.DrainRequested());
             case "removed" -> {
                 t.apply(new HealthEvent.DrainRequested());
@@ -41,6 +54,7 @@ class HealthTrackerTest {
 
     private static final HealthState HEALTHY = new HealthState.Healthy(0);
     private static final HealthState UNHEALTHY = new HealthState.Unhealthy(0, "seed", 1);
+    private static final HealthState SLOW_START = new HealthState.SlowStart(0, RAMP_MS);
     private static final HealthState DRAINING = new HealthState.Draining(0);
     private static final HealthState REMOVED = new HealthState.Removed(0);
 
@@ -66,6 +80,11 @@ class HealthTrackerTest {
                 Arguments.of(UNHEALTHY, FAIL, "unhealthy", "stays out, failure count deepens"),
                 Arguments.of(UNHEALTHY, DRAIN, "draining", "an ejected backend can still be drained"),
                 Arguments.of(UNHEALTHY, EMPTY, "unhealthy", "not draining, so irrelevant"),
+
+                Arguments.of(SLOW_START, OK, "slow_start", "still ramping; only time ends the ramp"),
+                Arguments.of(SLOW_START, FAIL, "unhealthy", "a ramping backend fails out like any other"),
+                Arguments.of(SLOW_START, DRAIN, "draining", "an operator outranks a ramp"),
+                Arguments.of(SLOW_START, EMPTY, "slow_start", "idle mid-ramp is not an event"),
 
                 Arguments.of(DRAINING, OK, "draining", "probes must not revive a deliberate drain"),
                 Arguments.of(DRAINING, FAIL, "draining", "already leaving; failure adds nothing"),
@@ -93,7 +112,7 @@ class HealthTrackerTest {
     @Test
     void tableCoversEveryStateEventCombination() {
         List<Arguments> rows = transitionTable().toList();
-        assertEquals(4 * 4, rows.size(),
+        assertEquals(5 * 4, rows.size(),
                 "the table must enumerate all states x events, or a transition is unconsidered");
     }
 
@@ -222,10 +241,87 @@ class HealthTrackerTest {
     }
 
     @Test
-    void onlyHealthyAcceptsTraffic() {
+    void onlyHealthyAndRampingAcceptTraffic() {
         assertTrue(HEALTHY.acceptsTraffic());
+        assertTrue(SLOW_START.acceptsTraffic(), "a ramping backend takes traffic, just less of it");
         assertFalse(UNHEALTHY.acceptsTraffic());
         assertFalse(DRAINING.acceptsTraffic(), "draining finishes in-flight but takes nothing new");
         assertFalse(REMOVED.acceptsTraffic());
+    }
+
+    /**
+     * Panic ignores health, not intent. Conscripting a host an operator has
+     * deliberately drained would make a drain unreliable exactly when someone is
+     * relying on it — mid-maintenance, during an incident.
+     */
+    @Test
+    void panicRecruitsUnhealthyBackendsButNotDrainedOnes() {
+        assertTrue(HEALTHY.acceptsTrafficInPanic());
+        assertTrue(SLOW_START.acceptsTrafficInPanic());
+        assertTrue(UNHEALTHY.acceptsTrafficInPanic(), "the whole point of panic");
+        assertFalse(DRAINING.acceptsTrafficInPanic(), "a drain is an instruction, not a health reading");
+        assertFalse(REMOVED.acceptsTrafficInPanic());
+    }
+
+    // ------------------------------------------------------------- slow start
+
+    @Test
+    void readmissionRampsWhenSlowStartIsConfigured() {
+        MutableClock clock = clock();
+        HealthTracker t = new HealthTracker(1, 1, RAMP_MS, clock);
+        t.apply(new HealthEvent.ProbeFailed("down"));
+
+        HealthState back = t.apply(new HealthEvent.ProbeSucceeded());
+        assertInstanceOf(HealthState.SlowStart.class, back, "recovery must ramp, not snap back");
+        assertTrue(back.acceptsTraffic(), "ramping still serves");
+    }
+
+    @Test
+    void readmissionIsImmediateWhenNoRampIsConfigured() {
+        HealthTracker t = new HealthTracker(1, 1, 0L, clock());
+        t.apply(new HealthEvent.ProbeFailed("down"));
+
+        assertInstanceOf(HealthState.Healthy.class, t.apply(new HealthEvent.ProbeSucceeded()),
+                "a zero ramp must not invent a slow_start state with no behaviour behind it");
+    }
+
+    @Test
+    void theRampEndsOnTheFirstProbeAfterItElapses() {
+        MutableClock clock = clock();
+        HealthTracker t = new HealthTracker(1, 1, RAMP_MS, clock);
+        t.apply(new HealthEvent.ProbeFailed("down"));
+        t.apply(new HealthEvent.ProbeSucceeded());
+
+        clock.advanceMillis(RAMP_MS - 1);
+        assertEquals("slow_start", t.apply(new HealthEvent.ProbeSucceeded()).label(), "1 ms short");
+
+        clock.advanceMillis(1);
+        assertEquals("healthy", t.apply(new HealthEvent.ProbeSucceeded()).label(), "ramp complete");
+    }
+
+    /**
+     * The share is what actually throttles a recovering backend, so the shape of
+     * the ramp is asserted directly rather than inferred from selection counts.
+     */
+    @Test
+    void theShareRisesLinearlyAcrossTheRamp() {
+        HealthState.SlowStart ramp = new HealthState.SlowStart(T0, 1_000);
+
+        assertEquals(0.05, ramp.share(T0), 1e-9, "never zero, or a long ramp starves the backend");
+        assertEquals(0.5, ramp.share(T0 + 500), 1e-9);
+        assertEquals(1.0, ramp.share(T0 + 1_000), 1e-9);
+        assertEquals(1.0, ramp.share(T0 + 5_000), 1e-9, "past the ramp is full share, not more");
+    }
+
+    @Test
+    void aRampingBackendThatBreaksAgainLeavesRotation() {
+        MutableClock clock = clock();
+        HealthTracker t = new HealthTracker(1, 2, RAMP_MS, clock);
+        t.apply(new HealthEvent.ProbeFailed("1"));
+        t.apply(new HealthEvent.ProbeFailed("2"));
+        assertEquals("slow_start", t.apply(new HealthEvent.ProbeSucceeded()).label());
+
+        assertEquals("slow_start", t.apply(new HealthEvent.ProbeFailed("blip")).label(), "1 of 2");
+        assertEquals("unhealthy", t.apply(new HealthEvent.ProbeFailed("again")).label(), "2 of 2");
     }
 }
