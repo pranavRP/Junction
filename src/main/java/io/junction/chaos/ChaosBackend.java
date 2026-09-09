@@ -65,6 +65,7 @@ public final class ChaosBackend {
     private EventLoopGroup boss;
     private EventLoopGroup workers;
     private Channel channel;
+    private boolean stopped;
 
     public ChaosBackend(int port, String id) {
         this.port = port;
@@ -109,7 +110,19 @@ public final class ChaosBackend {
         return ((InetSocketAddress) channel.localAddress()).getPort();
     }
 
+    /**
+     * Idempotent. Tests kill a backend to create an outage and then close the
+     * harness, which stops everything again; without this the second call closes
+     * a channel whose event executor is already terminated and throws
+     * {@code RejectedExecutionException} out of the teardown, masking the real
+     * result of the test. The channel reference is kept rather than cleared, so
+     * {@link #boundPort()} still answers for a backend a test has killed.
+     */
     public void stop() {
+        if (stopped) {
+            return;
+        }
+        stopped = true;
         if (channel != null) {
             channel.close().syncUninterruptibly();
         }

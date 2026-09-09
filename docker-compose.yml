@@ -1,9 +1,11 @@
 name: junction
 
-# Phase 2 topology: the proxy in front of a three-backend pool with active
-# health checking. Break one with:
+# Phase 3 topology: the proxy in front of a three-backend pool with active
+# health checking, circuit breaking, and a bounded retry budget. Break one with:
 #   docker compose exec backend-2 sh -c 'wget -qO- localhost:8000/_chaos/unhealthy'
-# and watch traffic drain off it within a couple of probe intervals.
+# and watch traffic drain off it. Under load the breaker gets there first (it
+# counts real 5xx responses); idle, the active probe gets there in
+# interval_ms x unhealthy_threshold. Repair it with /_chaos/healthy.
 #
 # `wrk` is behind the `load` profile so `docker compose up` stays lightweight.
 

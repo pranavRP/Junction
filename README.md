@@ -4,10 +4,13 @@ An L7 HTTP/1.1 load balancer written in Java 21 and Netty, built with the
 observability, SLOs, and capacity model you would need to actually be on-call
 for it.
 
-> **Status: Phase 1 of 6 complete.** The proxy streams, routes, and enforces
-> limits. Load balancing, health checking, and circuit breaking are *not built
-> yet* — see [Roadmap](#roadmap). Everything claimed below has a number and a
-> command behind it; nothing is aspirational.
+> **Status: Phase 3 of 6 complete.** The proxy streams, routes, enforces limits,
+> balances across a pool, health-checks its backends, pools upstream connections,
+> breaks circuits on what real traffic sees, ramps recovering backends, bounds
+> retries with a budget, and panics rather than blackholes. Admission control,
+> metrics and the admin API are *not built yet* — see [Roadmap](#roadmap).
+> Everything claimed below has a number and a command behind it; nothing is
+> aspirational.
 
 ---
 
@@ -55,9 +58,9 @@ Packages mirror the component boundaries exactly, and no package depends upward.
 | `io.junction.route` | `Host` + path-prefix → pool name | **built** |
 | `io.junction.config` | Immutable record graph, YAML parse, validation | **built** |
 | `io.junction.chaos` | Controllable backend (test fixture, not part of the proxy) | **built** |
-| `io.junction.balance` | Round-robin, least-conn, P2C, consistent hash | Phase 2 |
-| `io.junction.backend` | Pool registry, health state machine, breaker, slow start | Phase 2–3 |
-| `io.junction.pool` | Per-EventLoop upstream connection pool | Phase 2 |
+| `io.junction.balance` | Round-robin, least-conn, P2C, consistent hash | **built** |
+| `io.junction.backend` | Pool registry, health state machine, breaker, retry budget, slow start | **built** |
+| `io.junction.pool` | Per-EventLoop upstream connection pool | **built** |
 | `io.junction.admit` | Admission control, load shedding | Phase 4 |
 | `io.junction.obs` | Metrics, structured access log, tracing | Phase 5 |
 | `io.junction.admin` | Admin HTTP API | Phase 6 |
@@ -78,7 +81,7 @@ very different levels of understanding, and this is the second one.
 ## Quickstart
 
 ```bash
-docker compose up -d          # junction :8080 + one chaos backend
+docker compose up -d          # junction :8080 + a three-backend pool
 curl -i http://localhost:8080/
 ```
 
@@ -98,7 +101,22 @@ curl -i -H "X-Chaos-Status: 503" http://localhost:8080/   # error passthrough
 curl -i -H "X-Chaos-Chunks: 5"   http://localhost:8080/   # chunked download
 ```
 
-Run the tests (this is the real gate — 57 tests, Netty leak detection at
+Break a backend and watch it leave the rotation, then repair it and watch it come
+back. `X-Backend-Id` on each response says which one served it:
+
+```bash
+docker compose exec backend-2 sh -c 'wget -qO- localhost:8000/_chaos/unhealthy'
+for i in $(seq 20); do curl -s -D- -o/dev/null http://localhost:8080/ | grep -i x-backend-id; done
+docker compose exec backend-2 sh -c 'wget -qO- localhost:8000/_chaos/healthy'
+```
+
+Two independent mechanisms take it out, and which one wins depends on traffic.
+With load running, the **circuit breaker** trips first, because it counts real
+5xx responses and does not have to wait for anything. Idle, the **active health
+probe** gets there in `interval_ms × unhealthy_threshold`. That is the whole
+argument for having both.
+
+Run the tests (this is the real gate — 205 tests, Netty leak detection at
 `PARANOID`, test JVM capped at `-Xmx256m`):
 
 ```bash
@@ -164,6 +182,29 @@ The heap result is enforced structurally, not by a threshold: the test JVM runs
 with `-Xmx256m`, so an implementation that buffered a 1 GB body would die with
 `OutOfMemoryError` rather than quietly drifting past an assertion.
 
+### Resilience gates
+
+Every one of these is an assertion in `./gradlew test`, not a number typed into a
+document. Both run against real sockets and real backends.
+
+| Gate | Result |
+|---|---|
+| **Phase 2** — kill a backend mid-load, client error rate back to 0 within 10 s | ✅ **Met.** 513 ms, 76 errors in the window. |
+| **Phase 3** — total backend outage produces ≤ 1.1× normal upstream volume | ✅ **Met.** 200 client requests → 220 upstream attempts, **1.100×**. |
+
+The Phase 3 number lands exactly on the ceiling because that is what a budget
+does: with every backend down, every request wants to retry, so the budget is
+saturated and 10% is spent to the token. The control case in the same test class
+— retries switched off — produces exactly 1.000×, which is what shows the surplus
+is retries and not some other source of upstream traffic. With `max_attempts: 3`
+and no budget it would have been 3.000×.
+
+**And the honest limitation:** the retry budget bounds amplification, it does not
+make retries *smart*. A retry can land on the same dead backend it just failed
+against, because the breaker may not have tripped yet on one failure. That is
+visible in the tests and left as-is: preferring an untried backend is a Phase 4
+change, and it is the breaker's job to make it moot.
+
 ---
 
 ## What is built
@@ -183,6 +224,44 @@ trie is what you reach for *after* measuring.
 **Limits, each with its own status code and a closed-enum reason label** —
 `431` headers, `414` URI, `413` body, `408` idle client, `504` slow backend,
 `502` connect failure, `404` no route.
+
+**Balancing** — smooth weighted round robin as a precomputed lock-free schedule,
+least-connections, P2C, and consistent hashing with bounded loads. P2C is the
+default: near-optimal spread at O(1) with no shared state and no herd. Strategies
+take an already-extracted string rather than an HTTP request, so the whole package
+is testable without a socket.
+
+**Health** — a sealed four-state machine per backend driven by active probes on a
+dedicated control-plane thread, jittered per backend so the probes do not
+synchronise into a spike. Asymmetric thresholds: slow to eject, slower to trust.
+
+**Circuit breaking and passive outlier ejection** — one mechanism, not two. Every
+request outcome feeds a per-backend breaker: connect refusals, upstream resets,
+request timeouts, and 5xx count as failures; 4xx does not, because a client
+sending a bad request is no evidence that the backend is unwell. The cooldown
+doubles per re-open to a ceiling, and each expiry admits a bounded number of trial
+requests. This exists because MEA-012 measured the gap it fills — an active probe
+cannot react faster than its own interval, which left 76 client errors inside the
+ejection window.
+
+**Retry budget** — retries are capped as a fraction of request volume, not per
+request, because the failure mode is aggregate: during a total outage every
+request failing and every failure retrying is the proxy finishing off whatever the
+outage started. `budget_percent` is validated to 0..100, so the worst an operator
+can configure is a wider ceiling, never no ceiling. Retries are confined to the
+connect failure, which is the only point in a streaming proxy where a retry is
+honest — nothing has been sent, so nothing is replayed.
+
+**Slow start** — a backend re-admitted by probes ramps its share from 5% to 100%
+across `slow_start_ms` instead of taking its full 1/N with a cold JIT and an empty
+connection pool. The ramp is on admission probability, so all four strategies ramp
+without a line of change in any of them.
+
+**Panic mode** — below `panic_percent` available backends the pool stops honouring
+health and spreads across everything that has not been deliberately *drained*. A
+half-dead pool would otherwise hand the survivors more than double their share and
+take them down in turn. Panic ignores health, not intent: a host an operator
+drained for maintenance is not conscripted back.
 
 **Config** — immutable record graph, validated at startup. Every error is
 reported in one pass with a field path, and unknown keys are rejected outright:
@@ -212,26 +291,34 @@ before the next begins.
 |---|---|---|---|
 | **0** | Netty spike, chaos backend, compose | One request end-to-end + one number on disk | ✅ done |
 | **1** | Core streaming proxy, routing, limits, config | 1 GB upload under 50 MB heap growth, zero leaks | ✅ done |
-| **2** | Backend pools, balancing (RR / least-conn / P2C / consistent hash), active health checks, per-EventLoop connection pool | Kill a backend mid-load → client error rate returns to 0 within 10 s | next |
-| **3** | Circuit breaker, outlier ejection, slow start, **retry budget**, panic mode | Total backend outage produces ≤ 1.1× normal upstream volume | planned |
-| **4** | Admission control, load shedding, backpressure tuning, find the knee | At 2× the knee, served throughput stays flat and p99 rises < 2× | planned |
+| **2** | Backend pools, balancing (RR / least-conn / P2C / consistent hash), active health checks, per-EventLoop connection pool | Kill a backend mid-load → client error rate returns to 0 within 10 s | ✅ done |
+| **3** | Circuit breaker, outlier ejection, slow start, **retry budget**, panic mode | Total backend outage produces ≤ 1.1× normal upstream volume | ✅ done |
+| **4** | Admission control, load shedding, backpressure tuning, find the knee | At 2× the knee, served throughput stays flat and p99 rises < 2× | next |
 | **5** | Prometheus/Micrometer RED metrics, structured access log, Grafana dashboards, burn-rate alerts | A stranger diagnoses an injected fault from dashboards in 5 minutes | planned |
 | **6** | Graceful drain, hot config reload, admin API, capacity model, runbook, Game Day | Capacity model predicts measured max RPS within ±15% | planned |
 | 7 | Virtual-threads implementation benchmarked head-to-head against Netty | *optional* | planned |
 | 8 | fd exhaustion, ephemeral port exhaustion, accept-queue overflow, `TCP_NODELAY`/delayed-ACK — each reproduced and documented | *optional* | planned |
 
-**Open questions carried into Phase 2**, recorded before the work rather than
+**Open questions carried into Phase 4**, recorded before the work rather than
 rationalised after it:
 
-- Where does the remaining 2.8× proxy penalty actually go? Unprofiled. Candidates
-  are the extra userspace copy per hop, per-message flush syscalls, Netty's 8 KB
-  default chunk size, and the current one-upstream-per-downstream pinning. **Do
-  not tune anything before profiling.**
-- Phase 1 pins exactly one upstream connection per downstream connection. Phase 2
-  replaces it with a real pool — but keep-alive alone already recovered most of
-  the gap, so the pool must be *proven* to help, not assumed to.
-- Per-EventLoop pools mean up to `cores × maxIdle` idle sockets per backend. With
-  8 cores and maxIdle 64 that is 512. Measure before deciding if it is acceptable.
+- Where does the remaining 2.8× proxy penalty actually go? Still unprofiled.
+  Candidates are the extra userspace copy per hop, per-message flush syscalls, and
+  Netty's 8 KB default chunk size. **Do not tune anything before profiling** —
+  Phase 4 profiles it, and every phase so far has resisted guessing at it.
+- `request_timeout_ms` is really a *total transaction* timeout: it is armed when
+  the request head goes upstream, so it spans the whole request-body upload. A
+  client legitimately uploading over a slow link is killed by a limit that exists
+  to catch a silent backend. Fixing it needs a separate stall detector, not a
+  moved timer — see OPQ-009. Phase 4 owns timeouts.
+- Retries currently cover the connect failure only. Covering an idempotent request
+  that was sent and got no response would need the request head retained past the
+  write, which is cheap; covering one with a body would need the body buffered,
+  which contradicts the streaming design. Decide whether the first is worth it.
+- Slow start ships **off by default**, because the right ramp is a property of the
+  backend and not of the proxy. That means the one Phase 3 feature with no default
+  behaviour is also the one least likely to be exercised in a demo. Measure it
+  against a real cold JVM before recommending a value.
 
 ---
 
