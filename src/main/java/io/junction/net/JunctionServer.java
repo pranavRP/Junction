@@ -1,5 +1,6 @@
 package io.junction.net;
 
+import io.junction.admit.AdmissionController;
 import io.junction.backend.HealthChecker;
 import io.junction.backend.PoolRegistry;
 import io.junction.config.JunctionConfig;
@@ -48,6 +49,7 @@ public final class JunctionServer {
     private EventLoopGroup workers;
     private Channel listenChannel;
     private ConnectionLimitHandler connectionLimit;
+    private AdmissionController admit;
     private HealthChecker healthChecker;
 
     public JunctionServer(JunctionConfig config) {
@@ -78,7 +80,8 @@ public final class JunctionServer {
         workers = new NioEventLoopGroup();
         connectionLimit = new ConnectionLimitHandler(s.maxConnections());
 
-        ProxyContext context = new ProxyContext(router, pools, connectionPools, s);
+        admit = new AdmissionController(s.maxInFlight());
+        ProxyContext context = new ProxyContext(router, pools, connectionPools, s, admit);
 
         ServerBootstrap b = new ServerBootstrap()
                 .group(acceptor, workers)
@@ -120,6 +123,10 @@ public final class JunctionServer {
 
     public int activeConnections() {
         return connectionLimit == null ? 0 : connectionLimit.activeConnections();
+    }
+
+    public AdmissionController admission() {
+        return admit;
     }
 
     public PoolRegistry pools() {

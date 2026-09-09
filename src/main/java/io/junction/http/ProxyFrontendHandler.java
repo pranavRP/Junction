@@ -78,6 +78,8 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
     private int attempt;
 
     private boolean awaitingResponse;
+    /** Whether this connection currently holds an admission permit. */
+    private boolean admitted;
     private boolean shortCircuited;
     private boolean pendingFlushUpstream;
     /** Whether the backend's response permits reusing its connection. */
@@ -117,6 +119,15 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
                 if (awaitingResponse) {
                     break;
                 }
+                // Cheapest possible rejection, and deliberately the first thing
+                // tried: over capacity we spend no route lookup, no pick, and no
+                // upstream connection on a request we are not going to serve.
+                if (!admitted && !context.admit().tryAcquire()) {
+                    inbox.pollFirst();
+                    shed(ctx, req);
+                    continue;
+                }
+                admitted = true;
                 if (HttpUtil.getContentLength(req, -1L) > server.maxBodyBytes()) {
                     inbox.pollFirst();
                     fail(ctx, HttpResponseStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large");
@@ -384,6 +395,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
             cancelRequestTimeout();
             recordOutcome(false);
             releaseInflight();
+            releaseAdmission();
             drainInbox();
             // Response bytes may already be downstream; a partial body cannot be
             // retracted, so closing is the only honest recovery.
@@ -404,6 +416,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
             cancelRequestTimeout();
             recordOutcome(false);
             releaseInflight();
+            releaseAdmission();
             drainInbox();
             Responses.sendAndClose(downstream, HttpResponseStatus.BAD_GATEWAY, "upstream_error");
         } else {
@@ -434,6 +447,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
             }
         }
         releaseInflight();
+        releaseAdmission();
     }
 
     private String backendIdOf(Channel channel) {
@@ -453,6 +467,19 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
             backend.recordSuccess();
         } else {
             backend.recordFailure();
+        }
+    }
+
+    /**
+     * R-6: the admission permit is returned on every path, exactly once. Guarded
+     * by the flag rather than released hopefully — a stray release would raise
+     * the process-wide ceiling permanently, and the damage would only show up as
+     * an overload that admission control mysteriously failed to stop.
+     */
+    private void releaseAdmission() {
+        if (admitted) {
+            admitted = false;
+            context.admit().release();
         }
     }
 
@@ -512,7 +539,21 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         attempt = 0;
         awaitingResponse = false;
         shortCircuited = true;
+        releaseAdmission();
         Responses.sendAndClose(ctx.channel(), status, reason);
+    }
+
+    /**
+     * Refuses one request over the concurrency limit. No permit was taken, so
+     * there is nothing to release; {@code shortCircuited} discards whatever the
+     * codec still delivers for this request.
+     */
+    private void shed(ChannelHandlerContext ctx, HttpRequest req) {
+        attempt = 0;
+        shortCircuited = true;
+        boolean bodiless = !HttpUtil.isTransferEncodingChunked(req)
+                && HttpUtil.getContentLength(req, 0L) == 0L;
+        Responses.shed(ctx.channel(), bodiless && HttpUtil.isKeepAlive(req));
     }
 
     private void drainInbox() {

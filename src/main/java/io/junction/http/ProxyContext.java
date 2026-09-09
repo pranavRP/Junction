@@ -1,5 +1,6 @@
 package io.junction.http;
 
+import io.junction.admit.AdmissionController;
 import io.junction.backend.PoolRegistry;
 import io.junction.config.ServerConfig;
 import io.junction.pool.UpstreamPool;
@@ -17,12 +18,15 @@ import java.util.Map;
  *
  * @param connectionPools one upstream pool per backend pool, keyed by pool name;
  *                        separate because pool sizing is per-pool config
+ * @param admit           process-wide in-flight cap, shared by every connection:
+ *                        the resource it protects is this process, not a pool
  */
 public record ProxyContext(
         Router router,
         PoolRegistry pools,
         Map<String, UpstreamPool> connectionPools,
-        ServerConfig server) {
+        ServerConfig server,
+        AdmissionController admit) {
 
     public ProxyContext {
         connectionPools = Map.copyOf(connectionPools);

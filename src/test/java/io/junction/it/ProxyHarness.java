@@ -151,6 +151,12 @@ final class ProxyHarness implements AutoCloseable {
                 s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
     }
 
+    static ServerConfig withMaxInFlight(ServerConfig s, int limit) {
+        return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
+                s.maxHeaderBytes(), s.maxUriLength(), s.maxBodyBytes(),
+                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), limit);
+    }
+
     static ServerConfig withMaxUriLength(ServerConfig s, int len) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), len, s.maxBodyBytes(),
