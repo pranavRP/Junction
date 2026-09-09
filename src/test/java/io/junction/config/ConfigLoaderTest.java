@@ -416,6 +416,35 @@ class ConfigLoaderTest {
     }
 
     @Test
+    void rejectsAWriteBufferCeilingBelowItsFloor() {
+        assertHasError(errors("""
+                server:
+                  write_buffer_low_bytes: 65536
+                  write_buffer_high_bytes: 32768
+                pools:
+                  - name: api
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "server.write_buffer_high_bytes (32768) must be >=");
+    }
+
+    @Test
+    void stallTimeoutIsOffAtZero() {
+        ConfigResult r = parse("""
+                server:
+                  stall_timeout_ms: 0
+                pools:
+                  - name: api
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """);
+        assertInstanceOf(ConfigResult.Valid.class, r);
+        assertEquals(0, ((ConfigResult.Valid) r).config().server().stallTimeoutMs());
+    }
+
+    @Test
     void maxInFlightIsOffAtZeroAndRejectedBelowIt() {
         ConfigResult off = parse("""
                 server:

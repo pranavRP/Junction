@@ -93,7 +93,8 @@ public final class ConfigLoader {
         v.rejectUnknownKeys("server", m, Set.of(
                 "port", "admin_port", "backlog", "max_connections", "max_header_bytes",
                 "max_uri_length", "max_body_bytes", "idle_timeout_ms",
-                "request_timeout_ms", "connect_timeout_ms", "max_in_flight"));
+                "request_timeout_ms", "stall_timeout_ms", "connect_timeout_ms",
+                "max_in_flight", "write_buffer_low_bytes", "write_buffer_high_bytes"));
 
         int errorsBefore = v.count();
         int port = v.port("server.port", m.get("port"), d.port());
@@ -103,6 +104,16 @@ public final class ConfigLoader {
         // conflict about a number the operator never wrote.
         if (v.count() == errorsBefore && port == adminPort) {
             v.error("server.admin_port must differ from server.port (both " + port + ")");
+        }
+        int lowWater = v.positiveInt("server.write_buffer_low_bytes",
+                m.get("write_buffer_low_bytes"), d.writeBufferLowBytes());
+        int highWater = v.positiveInt("server.write_buffer_high_bytes",
+                m.get("write_buffer_high_bytes"), d.writeBufferHighBytes());
+        // Netty rejects a low mark above the high mark outright; catching it here
+        // turns a stack trace at bind time into a config error with a field path.
+        if (highWater < lowWater) {
+            v.error("server.write_buffer_high_bytes (" + highWater
+                    + ") must be >= server.write_buffer_low_bytes (" + lowWater + ")");
         }
         return new ServerConfig(
                 port,
@@ -114,8 +125,11 @@ public final class ConfigLoader {
                 v.positiveLong("server.max_body_bytes", m.get("max_body_bytes"), d.maxBodyBytes()),
                 v.positiveLong("server.idle_timeout_ms", m.get("idle_timeout_ms"), d.idleTimeoutMs()),
                 v.positiveLong("server.request_timeout_ms", m.get("request_timeout_ms"), d.requestTimeoutMs()),
+                v.nonNegativeLong("server.stall_timeout_ms", m.get("stall_timeout_ms"), d.stallTimeoutMs()),
                 v.positiveLong("server.connect_timeout_ms", m.get("connect_timeout_ms"), d.connectTimeoutMs()),
-                v.nonNegativeInt("server.max_in_flight", m.get("max_in_flight"), d.maxInFlight()));
+                v.nonNegativeInt("server.max_in_flight", m.get("max_in_flight"), d.maxInFlight()),
+                lowWater,
+                highWater);
     }
 
     // ----------------------------------------------------------------- pools

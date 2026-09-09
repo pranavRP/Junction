@@ -49,6 +49,7 @@ import java.util.concurrent.TimeUnit;
  * <tr><td>{@code X-Chaos-Size}</td><td>response body size in bytes</td></tr>
  * <tr><td>{@code X-Chaos-Chunks}</td><td>emit the body as N chunked pieces</td></tr>
  * <tr><td>{@code X-Chaos-Drop}</td><td>close the socket mid-response</td></tr>
+ * <tr><td>{@code X-Chaos-Stall}</td><td>stop reading after the head and never answer</td></tr>
  * </table>
  */
 public final class ChaosBackend {
@@ -174,6 +175,15 @@ public final class ChaosBackend {
                 size = (int) header(req, "X-Chaos-Size", -1);
                 chunks = (int) header(req, "X-Chaos-Chunks", 0);
                 drop = header(req, "X-Chaos-Drop", 0) > 0;
+                if (header(req, "X-Chaos-Stall", 0) > 0) {
+                    // Accept the head, then stop draining the socket entirely. The
+                    // receive window closes, the proxy's upstream write buffer
+                    // fills, and its own backpressure silences the client — the
+                    // one failure no timer used to be watching (OPQ-009).
+                    ctx.channel().config().setAutoRead(false);
+                    ReferenceCountUtil.release(msg);
+                    return;
+                }
                 keepAlive = HttpUtil.isKeepAlive(req);
                 received = 0;
                 requestsOnConnection++;

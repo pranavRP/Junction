@@ -47,6 +47,17 @@ import java.util.concurrent.TimeUnit;
  * holds a backend socket hostage and upstream concurrency is no longer capped by
  * the downstream connection count.
  *
+ * <p><b>One guard per phase, never two and never none (OPQ-009).</b> While the
+ * request body is streaming, the stall check watches for forward progress; once
+ * the last chunk is sent, it hands over to the response timeout, which watches
+ * for a backend that has gone quiet. Arming the response timeout at the start of
+ * the request instead — as Phase 1 did — makes it a total-transaction timeout, so
+ * a client legitimately uploading over a slow link is killed by a limit meant for
+ * a silent backend. Moving it alone is not enough: a backend that stalls
+ * mid-upload silences the client through our own backpressure, which is exactly
+ * the case the idle timer declines to act on (SUR-002), so the stall check has to
+ * exist for the move to be safe.
+ *
  * <p><b>Retries are confined to the connect failure (FR-3.4).</b> That is not
  * timidity, it is the only point in a streaming proxy where a retry is honest:
  * the request head is still sitting in the inbox and not one byte has gone
@@ -88,7 +99,11 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
     private long requestBodyBytes;
     private boolean downstreamKeepAlive = true;
     private String requestId = "";
+    /** Armed only once the request is fully sent; see {@link #armResponseTimeout}. */
     private ScheduledFuture<?> requestTimeout;
+    /** Armed only while a request body is streaming; see {@link #armStallCheck}. */
+    private ScheduledFuture<?> stallCheck;
+    private long lastProgressNanos;
 
     public ProxyFrontendHandler(ProxyContext context) {
         this.context = context;
@@ -278,15 +293,16 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         HeaderRewriter.forRequest(req, clientIp(ctx.channel()), "http", requestId);
 
         awaitingResponse = true;
-        scheduleRequestTimeout(ctx);
+        armStallCheck(ctx);
         writeUpstream(ctx, req);
     }
 
     private void forwardContent(ChannelHandlerContext ctx, HttpContent content) {
         requestBodyBytes += content.content().readableBytes();
+        lastProgressNanos = System.nanoTime();
         if (requestBodyBytes > server.maxBodyBytes()) {
             ReferenceCountUtil.release(content);
-            cancelRequestTimeout();
+            cancelTimers();
             // The backend has a partial body it will never see the end of, so this
             // connection cannot be pooled.
             upstreamReusable = false;
@@ -295,6 +311,13 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
             return;
         }
         writeUpstream(ctx, content);
+        if (content instanceof LastHttpContent) {
+            // The upload is over, so the only thing left to wait on is the
+            // backend. Hand the request from the stall detector to the response
+            // timeout: one guard per phase, never two and never none.
+            cancelStallCheck();
+            armResponseTimeout(ctx);
+        }
     }
 
     /**
@@ -392,7 +415,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         upstream = null;   // already closing; never return it to the pool
         if (awaitingResponse) {
             awaitingResponse = false;
-            cancelRequestTimeout();
+            cancelTimers();
             recordOutcome(false);
             releaseInflight();
             releaseAdmission();
@@ -413,7 +436,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         }
         if (awaitingResponse) {
             awaitingResponse = false;
-            cancelRequestTimeout();
+            cancelTimers();
             recordOutcome(false);
             releaseInflight();
             releaseAdmission();
@@ -448,6 +471,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         }
         releaseInflight();
         releaseAdmission();
+        cancelTimers();
     }
 
     private String backendIdOf(Channel channel) {
@@ -493,18 +517,75 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
 
     // -------------------------------------------------------------- timeouts
 
-    private void scheduleRequestTimeout(ChannelHandlerContext ctx) {
+    /**
+     * Guards the phase where only the backend can act: the request is fully sent
+     * and no response head has come back.
+     *
+     * <p>Deliberately <b>not</b> armed when the request starts (OPQ-009). Armed
+     * there it spans the upload too, so a client legitimately pushing a gigabyte
+     * over a slow link trips a limit whose entire purpose is to catch a backend
+     * that has gone quiet. The two are different failures and now have different
+     * timers.
+     */
+    private void armResponseTimeout(ChannelHandlerContext ctx) {
         cancelRequestTimeout();
         requestTimeout = ctx.executor().schedule(() -> {
-            upstreamReusable = false;   // a backend mid-answer cannot be reused
-            awaitingResponse = false;
             // A silent backend is exactly the outlier active probes are slowest
             // to catch: /healthz can keep answering while real requests hang.
-            recordOutcome(false);
-            finishRequest();
-            drainInbox();
-            Responses.sendAndClose(ctx.channel(), HttpResponseStatus.GATEWAY_TIMEOUT, "request_timeout");
+            expire(ctx, "request_timeout");
         }, server.requestTimeoutMs(), TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Guards the upload phase, and closes the hole that moving the response
+     * timeout would otherwise open.
+     *
+     * <p>If the backend stops draining mid-upload, our own write buffer fills,
+     * backpressure switches downstream reads off, and the idle timer is
+     * suppressed on purpose because the client's silence is our doing (SUR-002).
+     * With the response timeout no longer armed during the upload, nothing at all
+     * would be watching, and the connection would hang until one side gave up.
+     *
+     * <p>The check re-arms itself against a timestamp instead of being reset on
+     * every chunk: a 1 GB upload is a hundred thousand chunks, and a timer
+     * operation per chunk would cost more than the transfer.
+     */
+    private void armStallCheck(ChannelHandlerContext ctx) {
+        cancelStallCheck();
+        if (server.stallTimeoutMs() <= 0) {
+            return;
+        }
+        lastProgressNanos = System.nanoTime();
+        scheduleStallCheck(ctx, server.stallTimeoutMs());
+    }
+
+    private void scheduleStallCheck(ChannelHandlerContext ctx, long delayMs) {
+        stallCheck = ctx.executor().schedule(() -> {
+            long quietMs = (System.nanoTime() - lastProgressNanos) / 1_000_000L;
+            long remaining = server.stallTimeoutMs() - quietMs;
+            if (remaining > 0) {
+                scheduleStallCheck(ctx, remaining);
+                return;
+            }
+            // Only our own backpressure counts as a stall. If reads are still on,
+            // the silence is the client's and the idle timer owns it (408) — the
+            // two guards partition the cases rather than racing for them.
+            if (ctx.channel().config().isAutoRead()) {
+                scheduleStallCheck(ctx, server.stallTimeoutMs());
+                return;
+            }
+            expire(ctx, "upstream_stalled");
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    /** Ends a request that ran out of time, whichever timer noticed. */
+    private void expire(ChannelHandlerContext ctx, String reason) {
+        upstreamReusable = false;   // a backend mid-message cannot be reused
+        awaitingResponse = false;
+        recordOutcome(false);
+        finishRequest();
+        drainInbox();
+        Responses.sendAndClose(ctx.channel(), HttpResponseStatus.GATEWAY_TIMEOUT, reason);
     }
 
     private void cancelRequestTimeout() {
@@ -514,11 +595,24 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
+    private void cancelStallCheck() {
+        if (stallCheck != null) {
+            stallCheck.cancel(false);
+            stallCheck = null;
+        }
+    }
+
+    private void cancelTimers() {
+        cancelRequestTimeout();
+        cancelStallCheck();
+    }
+
     @Override
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
         if (evt instanceof IdleStateEvent idle && idle.state() == IdleState.ALL_IDLE) {
             // Silence we caused by suppressing reads is not the client being idle;
             // timing it out would punish a peer that is blocked on us (SUR-002).
+            // The stall check covers that case instead.
             if (!ctx.channel().config().isAutoRead()) {
                 return;
             }
@@ -535,7 +629,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
     // ---------------------------------------------------------------- failure
 
     private void fail(ChannelHandlerContext ctx, HttpResponseStatus status, String reason) {
-        cancelRequestTimeout();
+        cancelTimers();
         attempt = 0;
         awaitingResponse = false;
         shortCircuited = true;
@@ -583,7 +677,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        cancelRequestTimeout();
+        cancelTimers();
         drainInbox();
         // The client vanished mid-request, so the backend is mid-message and its
         // connection is unusable by anyone else.
@@ -596,7 +690,7 @@ public final class ProxyFrontendHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        cancelRequestTimeout();
+        cancelTimers();
         drainInbox();
         upstreamReusable = false;
         finishRequest();

@@ -110,8 +110,10 @@ final class ProxyHarness implements AutoCloseable {
                 4L * 1024 * 1024 * 1024, // 4 GiB so the 1 GB gate streams
                 60_000,                  // idle    -> 408
                 30_000,                  // request -> 504
+                5_000,                   // stall   -> 504
                 1_000,                   // connect -> 502
-                0);                      // admission control off unless a test asks
+                0,                       // admission control off unless a test asks
+                32 * 1024, 64 * 1024);   // write buffer watermarks
 
         JunctionConfig config = new JunctionConfig(
                 tune.apply(base),
@@ -125,42 +127,55 @@ final class ProxyHarness implements AutoCloseable {
     }
 
     // Records have no wither syntax, so these keep the tests readable at the
-    // call site instead of restating all ten components each time.
+    // call site instead of restating all fourteen components each time.
 
     static ServerConfig withRequestTimeout(ServerConfig s, long ms) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), s.maxUriLength(), s.maxBodyBytes(),
-                s.idleTimeoutMs(), ms, s.connectTimeoutMs(), s.maxInFlight());
+                s.idleTimeoutMs(), ms, s.stallTimeoutMs(), s.connectTimeoutMs(),
+                s.maxInFlight(), s.writeBufferLowBytes(), s.writeBufferHighBytes());
+    }
+
+    static ServerConfig withStallTimeout(ServerConfig s, long ms) {
+        return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
+                s.maxHeaderBytes(), s.maxUriLength(), s.maxBodyBytes(),
+                s.idleTimeoutMs(), s.requestTimeoutMs(), ms, s.connectTimeoutMs(),
+                s.maxInFlight(), s.writeBufferLowBytes(), s.writeBufferHighBytes());
     }
 
     static ServerConfig withIdleTimeout(ServerConfig s, long ms) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), s.maxUriLength(), s.maxBodyBytes(),
-                ms, s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
+                ms, s.requestTimeoutMs(), s.stallTimeoutMs(), s.connectTimeoutMs(),
+                s.maxInFlight(), s.writeBufferLowBytes(), s.writeBufferHighBytes());
     }
 
     static ServerConfig withMaxBodyBytes(ServerConfig s, long bytes) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), s.maxUriLength(), bytes,
-                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
+                s.idleTimeoutMs(), s.requestTimeoutMs(), s.stallTimeoutMs(), s.connectTimeoutMs(),
+                s.maxInFlight(), s.writeBufferLowBytes(), s.writeBufferHighBytes());
     }
 
     static ServerConfig withMaxHeaderBytes(ServerConfig s, int bytes) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 bytes, s.maxUriLength(), s.maxBodyBytes(),
-                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
+                s.idleTimeoutMs(), s.requestTimeoutMs(), s.stallTimeoutMs(), s.connectTimeoutMs(),
+                s.maxInFlight(), s.writeBufferLowBytes(), s.writeBufferHighBytes());
     }
 
     static ServerConfig withMaxInFlight(ServerConfig s, int limit) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), s.maxUriLength(), s.maxBodyBytes(),
-                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), limit);
+                s.idleTimeoutMs(), s.requestTimeoutMs(), s.stallTimeoutMs(), s.connectTimeoutMs(),
+                limit, s.writeBufferLowBytes(), s.writeBufferHighBytes());
     }
 
     static ServerConfig withMaxUriLength(ServerConfig s, int len) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), len, s.maxBodyBytes(),
-                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
+                s.idleTimeoutMs(), s.requestTimeoutMs(), s.stallTimeoutMs(), s.connectTimeoutMs(),
+                s.maxInFlight(), s.writeBufferLowBytes(), s.writeBufferHighBytes());
     }
 
     int port() {

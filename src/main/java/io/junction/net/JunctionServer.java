@@ -70,7 +70,8 @@ public final class JunctionServer {
             connectionPools.put(pool.name(), new UpstreamPool(
                     pool.pool(), clock,
                     () -> ProxyBackendHandlerFactory.newInitializer(
-                            s.maxUriLength(), s.maxHeaderBytes())));
+                            s.maxUriLength(), s.maxHeaderBytes()),
+                    new WriteBufferWaterMark(s.writeBufferLowBytes(), s.writeBufferHighBytes())));
         }
     }
 
@@ -91,9 +92,11 @@ public final class JunctionServer {
                 .childOption(ChannelOption.TCP_NODELAY, true)
                 .childOption(ChannelOption.SO_KEEPALIVE, true)
                 // DEC-005: these watermarks are the trigger points for the
-                // autoRead valve. Tuned in Phase 4.
+                // autoRead valve, so they are the one knob that changes how hard
+                // backpressure bites. Configurable because the right pair depends
+                // on the client population, not on the proxy — see MEA-006.
                 .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,
-                        new WriteBufferWaterMark(32 * 1024, 64 * 1024))
+                        new WriteBufferWaterMark(s.writeBufferLowBytes(), s.writeBufferHighBytes()))
                 // §12.4: a client may half-close after its request and still be
                 // waiting for the response; treating FIN as an abort breaks it.
                 .childOption(ChannelOption.ALLOW_HALF_CLOSURE, true)

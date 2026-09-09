@@ -10,7 +10,19 @@ server:
   max_uri_length: 8192        # exceeded -> 414
   max_body_bytes: 2147483647  # exceeded -> 413 (2 GiB, so the 1 GB gate streams)
   idle_timeout_ms: 60000      # idle client mid-request -> 408
-  request_timeout_ms: 30000   # backend silent this long -> 504
+  # Armed when the request has been fully sent upstream, not when it starts.
+  # Armed at the start it would span the whole upload, and a client legitimately
+  # uploading over a slow link would be killed by a limit that exists to catch a
+  # silent backend (OPQ-009).
+  request_timeout_ms: 30000   # backend silent this long after the upload -> 504
+
+  # The other half of request_timeout_ms. While our own backpressure is holding
+  # the client silent, the idle timer is deliberately suppressed (SUR-002) — so
+  # a backend that stops draining mid-upload would otherwise hang forever, with
+  # no timer left running. This one fires when nothing has moved at all.
+  # 0 disables it.
+  stall_timeout_ms: 5000      # no forward progress mid-upload -> 504
+
   connect_timeout_ms: 1000    # cannot reach backend -> 502
 
   # Admission control: concurrent requests in flight before shedding 503 with
@@ -21,6 +33,11 @@ server:
   # overloaded service only converts a fast 503 into a slow one.
   # 0 disables it. The shipped value comes from MEA-006, not from taste.
   max_in_flight: 0
+
+  # Pending write bytes that trip the autoRead valve (DEC-005). Too low and the
+  # valve thrashes; too high and this is a buffer with extra steps.
+  write_buffer_low_bytes: 32768
+  write_buffer_high_bytes: 65536
 
 pools:
   - name: api

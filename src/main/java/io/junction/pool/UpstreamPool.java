@@ -48,6 +48,12 @@ public final class UpstreamPool {
     private final UpstreamPoolConfig config;
     private final Clock clock;
     private final Supplier<ChannelInitializer<SocketChannel>> initializerFactory;
+    /**
+     * The upstream half of the autoRead valve: an upload stops being read from
+     * the client when <em>this</em> buffer fills, so the pair has to be the same
+     * pair the listener uses or only half the valve is tuned.
+     */
+    private final WriteBufferWaterMark watermark;
 
     /** Outer map is concurrent; every inner structure is confined to its loop. */
     private final Map<EventLoop, Map<String, Deque<Pooled>>> idle = new ConcurrentHashMap<>();
@@ -55,6 +61,14 @@ public final class UpstreamPool {
     public UpstreamPool(UpstreamPoolConfig config,
                         Clock clock,
                         Supplier<ChannelInitializer<SocketChannel>> initializerFactory) {
+        this(config, clock, initializerFactory, WriteBufferWaterMark.DEFAULT);
+    }
+
+    public UpstreamPool(UpstreamPoolConfig config,
+                        Clock clock,
+                        Supplier<ChannelInitializer<SocketChannel>> initializerFactory,
+                        WriteBufferWaterMark watermark) {
+        this.watermark = watermark;
         this.config = config;
         this.clock = clock;
         this.initializerFactory = initializerFactory;
@@ -141,8 +155,7 @@ public final class UpstreamPool {
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) config.maxConnectMs())
                 .option(ChannelOption.TCP_NODELAY, true)
-                .option(ChannelOption.WRITE_BUFFER_WATER_MARK,
-                        new WriteBufferWaterMark(32 * 1024, 64 * 1024))
+                .option(ChannelOption.WRITE_BUFFER_WATER_MARK, watermark)
                 .handler(initializerFactory.get());
 
         bootstrap.connect(new InetSocketAddress(host, port))
