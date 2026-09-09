@@ -1,6 +1,8 @@
 package io.junction.backend;
 
 import io.junction.chaos.ChaosBackend;
+import io.junction.config.RetryConfig;
+import io.junction.config.BreakerConfig;
 import io.junction.config.BackendConfig;
 import io.junction.config.HealthConfig;
 import io.junction.config.PoolConfig;
@@ -31,8 +33,9 @@ class HealthCheckerTest {
     private HealthChecker checker;
 
     private static PoolConfig poolConfig(int port, int healthyThreshold, int unhealthyThreshold) {
-        return new PoolConfig("api", Strategy.P2C, "",
+        return new PoolConfig("api", Strategy.P2C, "", 0, 0,
                 new HealthConfig("/healthz", 2_000, 500, healthyThreshold, unhealthyThreshold),
+                BreakerConfig.disabled(), RetryConfig.disabled(),
                 UpstreamPoolConfig.defaults(),
                 List.of(new BackendConfig("b1", "127.0.0.1", port, 100)));
     }
@@ -122,8 +125,9 @@ class HealthCheckerTest {
         // /_chaos/unhealthy is a control endpoint, so pointing the probe at it
         // proves the configured path is really what gets requested.
         BackendPool custom = BackendPool.create(
-                new PoolConfig("api", Strategy.P2C, "",
+                new PoolConfig("api", Strategy.P2C, "", 0, 0,
                         new HealthConfig("/_chaos/unhealthy", 2_000, 500, 1, 1),
+                        BreakerConfig.disabled(), RetryConfig.disabled(),
                         UpstreamPoolConfig.defaults(),
                         List.of(new BackendConfig("b1", "127.0.0.1", backend.boundPort(), 100))),
                 Clock.systemUTC());

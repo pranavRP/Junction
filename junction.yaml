@@ -19,6 +19,39 @@ pools:
     # (see design.md §2.2). round_robin | least_connections | consistent_hash
     # are the alternatives; consistent_hash additionally needs hash_key.
     strategy: p2c
+
+    # Below this percent of available backends, ignore health and spread across
+    # every backend that has not been deliberately drained. The survivors of a
+    # half-dead pool would take more than double their share and fall over in
+    # turn, so a chance on a backend that only looks dead beats a certain 503.
+    # 0 disables it, and then a fully ejected pool returns 503 no_healthy_backend.
+    panic_percent: 50
+
+    # Ramp a backend back up over this long after probes re-admit it, instead of
+    # handing a cold JIT and an empty cache its full 1/N the instant it passes
+    # one probe. 0 disables the ramp. Off by default because the right value is
+    # a property of the backend, not of the proxy.
+    slow_start_ms: 0
+
+    # Passive outlier detection: eject on what real traffic sees, not on what
+    # /healthz says. Active probes cannot react faster than interval_ms, which
+    # is where the 76 errors in MEA-012 came from.
+    breaker:
+      consecutive_failures: 5   # 0 disables the breaker entirely
+      base_cooldown_ms: 1000
+      max_cooldown_ms: 30000    # doubles per re-open, up to here
+      half_open_probes: 1       # trial requests admitted per cooldown expiry
+
+    # Retries are capped as a fraction of request volume, not per request. A
+    # per-request limit does not help: the failure mode is aggregate, and during
+    # a total outage every request retrying is the proxy finishing off whatever
+    # the outage started. budget_percent maxes out at 100, so amplification has
+    # a hard ceiling no matter how this is set.
+    retry:
+      max_attempts: 2           # including the first; 1 disables retries
+      budget_percent: 10        # -> the <= 1.1x upstream volume gate
+      min_per_second: 3         # floor, so a low-traffic pool can retry at all
+
     health:
       path: /healthz
       interval_ms: 2000

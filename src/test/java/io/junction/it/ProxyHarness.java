@@ -1,6 +1,8 @@
 package io.junction.it;
 
 import io.junction.chaos.ChaosBackend;
+import io.junction.config.RetryConfig;
+import io.junction.config.BreakerConfig;
 import io.junction.config.BackendConfig;
 import io.junction.config.HealthConfig;
 import io.junction.config.JunctionConfig;
@@ -50,10 +52,45 @@ final class ProxyHarness implements AutoCloseable {
                 List.of(new RouteConfig("*", "/", "api")), backendCount, strategy);
     }
 
+    /** Fast probes so ejection tests do not wait on a production interval. */
+    static final HealthConfig FAST_PROBES = new HealthConfig("/healthz", 200, 100, 2, 2);
+
+    /**
+     * Probes that will not fire during a short test. Resilience tests need the
+     * data path to keep choosing a dead backend, because what they are measuring
+     * is what the data path does about it — an active probe quietly ejecting the
+     * backend first would make the test pass without testing anything.
+     */
+    static final HealthConfig DORMANT_PROBES = new HealthConfig("/healthz", 60_000, 1_000, 2, 100);
+
+    /** Phase 3 harness: panic, breaker and retry are per-pool, so tests set them per-pool. */
+    static ProxyHarness startWithPolicy(int backendCount,
+                                        HealthConfig health,
+                                        int panicPercent,
+                                        BreakerConfig breaker,
+                                        RetryConfig retry) throws Exception {
+        return start(UnaryOperator.identity(), List.of(new RouteConfig("*", "/", "api")),
+                backendCount, Strategy.P2C, health, panicPercent, breaker, retry);
+    }
+
     static ProxyHarness start(UnaryOperator<ServerConfig> tune,
                               List<RouteConfig> routes,
                               int backendCount,
                               Strategy strategy) throws Exception {
+        // Phase 3 policy off by default, so the Phase 1 and 2 tests keep asserting
+        // exactly what they asserted before: a dead pool is a 503, not a panic pick.
+        return start(tune, routes, backendCount, strategy, FAST_PROBES,
+                0, BreakerConfig.disabled(), RetryConfig.disabled());
+    }
+
+    static ProxyHarness start(UnaryOperator<ServerConfig> tune,
+                              List<RouteConfig> routes,
+                              int backendCount,
+                              Strategy strategy,
+                              HealthConfig health,
+                              int panicPercent,
+                              BreakerConfig breaker,
+                              RetryConfig retry) throws Exception {
         List<ChaosBackend> started = new ArrayList<>();
         List<BackendConfig> configs = new ArrayList<>();
         for (int i = 0; i < backendCount; i++) {
@@ -75,13 +112,10 @@ final class ProxyHarness implements AutoCloseable {
                 30_000,                  // request -> 504
                 1_000);                  // connect -> 502
 
-        // Fast probes so ejection tests do not wait on a production interval.
-        HealthConfig health = new HealthConfig("/healthz", 200, 100, 2, 2);
-
         JunctionConfig config = new JunctionConfig(
                 tune.apply(base),
-                List.of(new PoolConfig("api", strategy, "",
-                        health, UpstreamPoolConfig.defaults(), configs)),
+                List.of(new PoolConfig("api", strategy, "", panicPercent, 0,
+                        health, breaker, retry, UpstreamPoolConfig.defaults(), configs)),
                 routes);
 
         JunctionServer server = new JunctionServer(config);
@@ -132,6 +166,10 @@ final class ProxyHarness implements AutoCloseable {
 
     ChaosBackend backend(int index) {
         return backends.get(index);
+    }
+
+    List<ChaosBackend> backends() {
+        return backends;
     }
 
     int backendPort() {

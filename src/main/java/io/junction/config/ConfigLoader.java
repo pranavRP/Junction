@@ -130,8 +130,9 @@ public final class ConfigLoader {
         for (int i = 0; i < list.size(); i++) {
             String path = "pools[" + i + "]";
             Map<String, Object> m = v.asMap(path, list.get(i));
-            v.rejectUnknownKeys(path, m,
-                    Set.of("name", "strategy", "hash_key", "health", "pool", "backends"));
+            v.rejectUnknownKeys(path, m, Set.of(
+                    "name", "strategy", "hash_key", "panic_percent", "slow_start_ms",
+                    "health", "breaker", "retry", "pool", "backends"));
 
             String name = v.nonBlank(path + ".name", m.get("name"));
             if (name != null && !seenPools.add(name)) {
@@ -145,7 +146,12 @@ public final class ConfigLoader {
                     name == null ? "<invalid>" : name,
                     strategy,
                     hashKey,
+                    v.percent(path + ".panic_percent", m.get("panic_percent"),
+                            PoolConfig.defaultPanicPercent()),
+                    v.nonNegativeLong(path + ".slow_start_ms", m.get("slow_start_ms"), 0),
                     parseHealth(v, path, m.get("health")),
+                    parseBreaker(v, path, m.get("breaker")),
+                    parseRetry(v, path, m.get("retry")),
                     parseUpstreamPool(v, path, m.get("pool")),
                     parseBackends(v, path, m.get("backends"))));
         }
@@ -216,6 +222,52 @@ public final class ConfigLoader {
                 timeout,
                 v.positiveInt(path + ".healthy_threshold", m.get("healthy_threshold"), d.healthyThreshold()),
                 v.positiveInt(path + ".unhealthy_threshold", m.get("unhealthy_threshold"), d.unhealthyThreshold()));
+    }
+
+    private static BreakerConfig parseBreaker(Validator v, String parent, Object node) {
+        BreakerConfig d = BreakerConfig.defaults();
+        if (node == null) {
+            return d;
+        }
+        String path = parent + ".breaker";
+        Map<String, Object> m = v.asMap(path, node);
+        v.rejectUnknownKeys(path, m, Set.of(
+                "consecutive_failures", "base_cooldown_ms", "max_cooldown_ms", "half_open_probes"));
+
+        long base = v.positiveLong(path + ".base_cooldown_ms", m.get("base_cooldown_ms"), d.baseCooldownMs());
+        long max = v.positiveLong(path + ".max_cooldown_ms", m.get("max_cooldown_ms"), d.maxCooldownMs());
+        // A ceiling below the floor means the doubling never happens and the
+        // written base_cooldown_ms silently never applies.
+        if (max < base) {
+            v.error(path + ".max_cooldown_ms (" + max + ") must be >= base_cooldown_ms (" + base + ")");
+        }
+        return new BreakerConfig(
+                v.nonNegativeInt(path + ".consecutive_failures", m.get("consecutive_failures"),
+                        d.consecutiveFailures()),
+                base,
+                max,
+                v.positiveInt(path + ".half_open_probes", m.get("half_open_probes"), d.halfOpenProbes()));
+    }
+
+    private static RetryConfig parseRetry(Validator v, String parent, Object node) {
+        RetryConfig d = RetryConfig.defaults();
+        if (node == null) {
+            return d;
+        }
+        String path = parent + ".retry";
+        Map<String, Object> m = v.asMap(path, node);
+        v.rejectUnknownKeys(path, m, Set.of("max_attempts", "budget_percent", "min_per_second"));
+
+        int attempts = v.positiveInt(path + ".max_attempts", m.get("max_attempts"), d.maxAttempts());
+        int percent = v.percent(path + ".budget_percent", m.get("budget_percent"), d.budgetPercent());
+        // Retries enabled with a zero budget and no floor can never fire. That is
+        // config that looks like a safety net and is not one.
+        int floor = v.nonNegativeInt(path + ".min_per_second", m.get("min_per_second"), d.minPerSecond());
+        if (attempts > 1 && percent == 0 && floor == 0) {
+            v.error(path + " allows " + attempts + " attempts but its budget is zero,"
+                    + " so no retry can ever happen (set budget_percent or min_per_second)");
+        }
+        return new RetryConfig(attempts, percent, floor);
     }
 
     private static UpstreamPoolConfig parseUpstreamPool(Validator v, String parent, Object node) {
@@ -475,6 +527,42 @@ public final class ConfigLoader {
             long val = positiveLong(path, node, def);
             if (val > Integer.MAX_VALUE) {
                 error(path + " must be <= " + Integer.MAX_VALUE + ", got " + val);
+                return def;
+            }
+            return (int) val;
+        }
+
+        /** For knobs where 0 is a meaningful "off", not a mistake. */
+        int nonNegativeInt(String path, Object node, int def) {
+            long val = nonNegativeLong(path, node, def);
+            if (val > Integer.MAX_VALUE) {
+                error(path + " must be <= " + Integer.MAX_VALUE + ", got " + val);
+                return def;
+            }
+            return (int) val;
+        }
+
+        long nonNegativeLong(String path, Object node, long def) {
+            boolean[] present = new boolean[1];
+            long val = number(path, node, def, present);
+            if (!present[0]) {
+                return def;
+            }
+            if (val < 0) {
+                error(path + " must be >= 0, got " + val);
+                return def;
+            }
+            return val;
+        }
+
+        int percent(String path, Object node, int def) {
+            boolean[] present = new boolean[1];
+            long val = number(path, node, def, present);
+            if (!present[0]) {
+                return def;
+            }
+            if (val < 0 || val > 100) {
+                error(path + " must be 0..100, got " + val);
                 return def;
             }
             return (int) val;

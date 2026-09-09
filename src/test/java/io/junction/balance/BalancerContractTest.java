@@ -1,6 +1,8 @@
 package io.junction.balance;
 
 import io.junction.backend.BackendRuntime;
+import io.junction.config.RetryConfig;
+import io.junction.config.BreakerConfig;
 import io.junction.config.BackendConfig;
 import io.junction.config.HealthConfig;
 import io.junction.config.PoolConfig;
@@ -22,9 +24,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class BalancerContractTest {
 
     private static Balancer balancerFor(Strategy strategy, List<BackendRuntime> backends) {
+        // Panic off: this asserts the base contract, and panic mode deliberately
+        // breaks one clause of it (an all-unhealthy pool starts returning backends
+        // again). PanicModeTest covers that separately.
         PoolConfig cfg = new PoolConfig("api", strategy,
                 strategy == Strategy.CONSISTENT_HASH ? "header:X-Session-Id" : "",
-                HealthConfig.defaults(), UpstreamPoolConfig.defaults(),
+                0, 0,
+                HealthConfig.defaults(), BreakerConfig.disabled(), RetryConfig.disabled(),
+                UpstreamPoolConfig.defaults(),
                 backends.stream().map(BackendRuntime::config).toList());
         return Balancers.create(cfg, backends);
     }

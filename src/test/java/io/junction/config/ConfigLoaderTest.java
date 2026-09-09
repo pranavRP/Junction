@@ -3,6 +3,8 @@ package io.junction.config;
 import org.junit.jupiter.api.Test;
 
 import java.io.StringReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -344,5 +346,143 @@ class ConfigLoaderTest {
                 """);
         assertInstanceOf(ConfigResult.Valid.class, r);
         assertEquals(0, ((ConfigResult.Valid) r).config().pools().get(0).backends().get(0).weight());
+    }
+
+    // ------------------------------------------------- Phase 3 resilience keys
+
+    private static final String RESILIENCE = """
+            pools:
+              - name: api
+                panic_percent: 40
+                slow_start_ms: 5000
+                breaker:
+                  consecutive_failures: 7
+                  base_cooldown_ms: 500
+                  max_cooldown_ms: 20000
+                  half_open_probes: 2
+                retry:
+                  max_attempts: 3
+                  budget_percent: 25
+                  min_per_second: 5
+                backends: [{ id: b1, host: h, port: 8000 }]
+            routes:
+              - { host: "*", prefix: "/", pool: api }
+            """;
+
+    @Test
+    void parsesTheResilienceBlocks() {
+        ConfigResult r = parse(RESILIENCE);
+        assertInstanceOf(ConfigResult.Valid.class, r);
+
+        PoolConfig pool = ((ConfigResult.Valid) r).config().pools().get(0);
+        assertEquals(40, pool.panicPercent());
+        assertEquals(5_000, pool.slowStartMs());
+        assertEquals(7, pool.breaker().consecutiveFailures());
+        assertEquals(500, pool.breaker().baseCooldownMs());
+        assertEquals(2, pool.breaker().halfOpenProbes());
+        assertEquals(3, pool.retry().maxAttempts());
+        assertEquals(25, pool.retry().budgetPercent());
+        assertEquals(5, pool.retry().minPerSecond());
+    }
+
+    /** Absent blocks must still produce working policy, not a disabled one. */
+    @Test
+    void resilienceDefaultsApplyWhenTheBlocksAreAbsent() {
+        PoolConfig pool = ((ConfigResult.Valid) parse(VALID)).config().pools().get(0);
+
+        assertEquals(50, pool.panicPercent(), "panic on by default, at Envoy's threshold");
+        assertEquals(0, pool.slowStartMs(), "slow start off by default: it is opt-in behaviour");
+        assertTrue(pool.breaker().enabled());
+        assertTrue(pool.retry().enabled());
+    }
+
+    /** 0 means off for these two, so the loader must not reject it as non-positive. */
+    @Test
+    void zeroDisablesPanicAndTheBreakerRatherThanFailing() {
+        ConfigResult r = parse("""
+                pools:
+                  - name: api
+                    panic_percent: 0
+                    breaker: { consecutive_failures: 0 }
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """);
+        assertInstanceOf(ConfigResult.Valid.class, r);
+
+        PoolConfig pool = ((ConfigResult.Valid) r).config().pools().get(0);
+        assertEquals(0, pool.panicPercent());
+        assertTrue(!pool.breaker().enabled());
+    }
+
+    @Test
+    void rejectsAPanicPercentOutsideItsRange() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    panic_percent: 140
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "panic_percent must be 0..100");
+    }
+
+    /**
+     * A cooldown ceiling below its own floor means the doubling never happens and
+     * the base the operator wrote never applies — config that looks tuned and is
+     * not.
+     */
+    @Test
+    void rejectsACooldownCeilingBelowItsFloor() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    breaker: { base_cooldown_ms: 5000, max_cooldown_ms: 1000 }
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "max_cooldown_ms (1000) must be >= base_cooldown_ms (5000)");
+    }
+
+    /** Retries with a zero budget are a safety net that can never catch anything. */
+    @Test
+    void rejectsRetriesThatCanNeverHappen() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    retry: { max_attempts: 3, budget_percent: 0, min_per_second: 0 }
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "no retry can ever happen");
+    }
+
+    /**
+     * The config the repo actually ships must load. It is the file the quickstart
+     * tells people to run and the one docker compose mounts, so a key renamed in
+     * the loader and not in the YAML is a broken {@code docker compose up} — the
+     * one path every reader takes first.
+     */
+    @Test
+    void theShippedConfigIsValid() {
+        Path shipped = Path.of("junction.yaml");
+        assertTrue(Files.isReadable(shipped), "junction.yaml missing from the repo root");
+
+        ConfigResult r = ConfigLoader.load(shipped);
+        if (r instanceof ConfigResult.Invalid invalid) {
+            org.junit.jupiter.api.Assertions.fail("junction.yaml no longer loads:\n" + invalid.message());
+        }
+    }
+
+    @Test
+    void rejectsUnknownKeysInsideTheNewBlocks() {
+        assertHasError(errors("""
+                pools:
+                  - name: api
+                    breaker: { consecutive_faliures: 5 }
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "pools[0].breaker has unknown key 'consecutive_faliures'");
     }
 }
