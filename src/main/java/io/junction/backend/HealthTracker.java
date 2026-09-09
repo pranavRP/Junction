@@ -18,14 +18,15 @@ import java.time.Clock;
  * consecutive successes so one lucky probe cannot restore a broken one. A single
  * counter with one threshold would make both mistakes.
  *
- * <p>Phase 3 inserts {@code SlowStart} between {@link HealthState.Unhealthy} and
- * {@link HealthState.Healthy}; the sealed switch below will fail to compile until
- * that transition is handled, which is the intent.
+ * <p><b>Re-admission goes through {@link HealthState.SlowStart}</b> when a ramp
+ * is configured. Inserting that state broke every sealed switch below until each
+ * one decided what to do with it, which is why the states are sealed.
  */
 public final class HealthTracker {
 
     private final int healthyThreshold;
     private final int unhealthyThreshold;
+    private final long slowStartMs;
     private final Clock clock;
 
     /** Written by the control plane only; read from event loops (R-3). */
@@ -34,13 +35,18 @@ public final class HealthTracker {
     private int consecutiveOk;
     private int consecutiveFailures;
 
-    public HealthTracker(HealthConfig config, Clock clock) {
-        this(config.healthyThreshold(), config.unhealthyThreshold(), clock);
+    public HealthTracker(HealthConfig config, long slowStartMs, Clock clock) {
+        this(config.healthyThreshold(), config.unhealthyThreshold(), slowStartMs, clock);
     }
 
     public HealthTracker(int healthyThreshold, int unhealthyThreshold, Clock clock) {
+        this(healthyThreshold, unhealthyThreshold, 0L, clock);
+    }
+
+    public HealthTracker(int healthyThreshold, int unhealthyThreshold, long slowStartMs, Clock clock) {
         this.healthyThreshold = healthyThreshold;
         this.unhealthyThreshold = unhealthyThreshold;
+        this.slowStartMs = slowStartMs;
         this.clock = clock;
         // Start healthy: a backend named in config is assumed good until probes
         // say otherwise. Starting unhealthy would blackhole all traffic for the
@@ -116,7 +122,7 @@ public final class HealthTracker {
             case HealthState.Unhealthy unhealthy -> switch (event) {
                 case HealthEvent.ProbeSucceeded ignored ->
                         consecutiveOk >= healthyThreshold
-                                ? new HealthState.Healthy(now())
+                                ? readmitted()
                                 : unhealthy;
                 // Refresh the failure count so operators can see how deep it is,
                 // without restarting the clock on when it went bad.
@@ -124,6 +130,21 @@ public final class HealthTracker {
                         unhealthy.since(), failed.reason(), consecutiveFailures);
                 case HealthEvent.DrainRequested ignored -> new HealthState.Draining(now());
                 case HealthEvent.InflightDrained ignored -> unhealthy;
+            };
+
+            // A ramping backend is already taking traffic, so it fails out on the
+            // same threshold a healthy one does. The ramp only ends on a probe:
+            // no timer, no scheduled wakeup, and no state that changes while
+            // nothing is watching it.
+            case HealthState.SlowStart slowStart -> switch (event) {
+                case HealthEvent.ProbeSucceeded ignored ->
+                        slowStart.rampComplete(now()) ? new HealthState.Healthy(now()) : slowStart;
+                case HealthEvent.ProbeFailed failed ->
+                        consecutiveFailures >= unhealthyThreshold
+                                ? new HealthState.Unhealthy(now(), failed.reason(), consecutiveFailures)
+                                : slowStart;
+                case HealthEvent.DrainRequested ignored -> new HealthState.Draining(now());
+                case HealthEvent.InflightDrained ignored -> slowStart;
             };
 
             case HealthState.Draining draining -> switch (event) {
@@ -138,6 +159,18 @@ public final class HealthTracker {
 
             case HealthState.Removed removed -> removed; // unreachable; terminal
         };
+    }
+
+    /**
+     * Where a backend goes when its probes start passing again. Skipping the ramp
+     * entirely when it is not configured matters: a {@code SlowStart} with a zero
+     * ramp would be a distinct state in every metric and log for no behavioural
+     * difference.
+     */
+    private HealthState readmitted() {
+        return slowStartMs > 0
+                ? new HealthState.SlowStart(now(), slowStartMs)
+                : new HealthState.Healthy(now());
     }
 
     private long now() {
