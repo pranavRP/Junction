@@ -93,7 +93,7 @@ public final class ConfigLoader {
         v.rejectUnknownKeys("server", m, Set.of(
                 "port", "admin_port", "backlog", "max_connections", "max_header_bytes",
                 "max_uri_length", "max_body_bytes", "idle_timeout_ms",
-                "request_timeout_ms", "connect_timeout_ms"));
+                "request_timeout_ms", "connect_timeout_ms", "max_in_flight"));
 
         int errorsBefore = v.count();
         int port = v.port("server.port", m.get("port"), d.port());
@@ -114,7 +114,8 @@ public final class ConfigLoader {
                 v.positiveLong("server.max_body_bytes", m.get("max_body_bytes"), d.maxBodyBytes()),
                 v.positiveLong("server.idle_timeout_ms", m.get("idle_timeout_ms"), d.idleTimeoutMs()),
                 v.positiveLong("server.request_timeout_ms", m.get("request_timeout_ms"), d.requestTimeoutMs()),
-                v.positiveLong("server.connect_timeout_ms", m.get("connect_timeout_ms"), d.connectTimeoutMs()));
+                v.positiveLong("server.connect_timeout_ms", m.get("connect_timeout_ms"), d.connectTimeoutMs()),
+                v.nonNegativeInt("server.max_in_flight", m.get("max_in_flight"), d.maxInFlight()));
     }
 
     // ----------------------------------------------------------------- pools

@@ -13,6 +13,15 @@ server:
   request_timeout_ms: 30000   # backend silent this long -> 504
   connect_timeout_ms: 1000    # cannot reach backend -> 502
 
+  # Admission control: concurrent requests in flight before shedding 503 with
+  # Retry-After. Not requests per second — by Little's law the in-flight count
+  # is throughput x latency, so one bound covers both, and it stays true when a
+  # backend slows down and an RPS figure would not. There is no queue: over the
+  # limit a request is shed immediately, because a queue in front of an
+  # overloaded service only converts a fast 503 into a slow one.
+  # 0 disables it. The shipped value comes from MEA-006, not from taste.
+  max_in_flight: 0
+
 pools:
   - name: api
     # p2c: near-optimal spread at O(1) with no shared state, and no herd

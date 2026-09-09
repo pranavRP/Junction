@@ -416,6 +416,31 @@ class ConfigLoaderTest {
     }
 
     @Test
+    void maxInFlightIsOffAtZeroAndRejectedBelowIt() {
+        ConfigResult off = parse("""
+                server:
+                  max_in_flight: 0
+                pools:
+                  - name: api
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """);
+        assertInstanceOf(ConfigResult.Valid.class, off);
+        assertEquals(0, ((ConfigResult.Valid) off).config().server().maxInFlight());
+
+        assertHasError(errors("""
+                server:
+                  max_in_flight: -1
+                pools:
+                  - name: api
+                    backends: [{ id: b1, host: h, port: 8000 }]
+                routes:
+                  - { host: "*", prefix: "/", pool: api }
+                """), "server.max_in_flight must be >= 0");
+    }
+
+    @Test
     void rejectsAPanicPercentOutsideItsRange() {
         assertHasError(errors("""
                 pools:

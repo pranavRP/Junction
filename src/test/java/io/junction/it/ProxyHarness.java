@@ -110,7 +110,8 @@ final class ProxyHarness implements AutoCloseable {
                 4L * 1024 * 1024 * 1024, // 4 GiB so the 1 GB gate streams
                 60_000,                  // idle    -> 408
                 30_000,                  // request -> 504
-                1_000);                  // connect -> 502
+                1_000,                   // connect -> 502
+                0);                      // admission control off unless a test asks
 
         JunctionConfig config = new JunctionConfig(
                 tune.apply(base),
@@ -129,31 +130,31 @@ final class ProxyHarness implements AutoCloseable {
     static ServerConfig withRequestTimeout(ServerConfig s, long ms) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), s.maxUriLength(), s.maxBodyBytes(),
-                s.idleTimeoutMs(), ms, s.connectTimeoutMs());
+                s.idleTimeoutMs(), ms, s.connectTimeoutMs(), s.maxInFlight());
     }
 
     static ServerConfig withIdleTimeout(ServerConfig s, long ms) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), s.maxUriLength(), s.maxBodyBytes(),
-                ms, s.requestTimeoutMs(), s.connectTimeoutMs());
+                ms, s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
     }
 
     static ServerConfig withMaxBodyBytes(ServerConfig s, long bytes) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), s.maxUriLength(), bytes,
-                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs());
+                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
     }
 
     static ServerConfig withMaxHeaderBytes(ServerConfig s, int bytes) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 bytes, s.maxUriLength(), s.maxBodyBytes(),
-                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs());
+                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
     }
 
     static ServerConfig withMaxUriLength(ServerConfig s, int len) {
         return new ServerConfig(s.port(), s.adminPort(), s.backlog(), s.maxConnections(),
                 s.maxHeaderBytes(), len, s.maxBodyBytes(),
-                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs());
+                s.idleTimeoutMs(), s.requestTimeoutMs(), s.connectTimeoutMs(), s.maxInFlight());
     }
 
     int port() {
