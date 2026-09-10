@@ -4,13 +4,15 @@ An L7 HTTP/1.1 load balancer written in Java 21 and Netty, built with the
 observability, SLOs, and capacity model you would need to actually be on-call
 for it.
 
-> **Status: Phase 3 of 6 complete.** The proxy streams, routes, enforces limits,
-> balances across a pool, health-checks its backends, pools upstream connections,
-> breaks circuits on what real traffic sees, ramps recovering backends, bounds
-> retries with a budget, and panics rather than blackholes. Admission control,
-> metrics and the admin API are *not built yet* — see [Roadmap](#roadmap).
-> Everything claimed below has a number and a command behind it; nothing is
-> aspirational.
+> **Status: Phase 4 of 6 complete, with one gate criterion unmet.** The proxy
+> streams, routes, enforces limits, balances across a pool, health-checks its
+> backends, pools upstream connections, breaks circuits on what real traffic sees,
+> ramps recovering backends, bounds retries with a budget, panics rather than
+> blackholes, and now sheds rather than queues. Metrics and the admin API are
+> *not built yet* — see [Roadmap](#roadmap). Everything claimed below has a number
+> and a command behind it; nothing is aspirational, and the one Phase 4 criterion
+> that could not be measured honestly is [marked as such](#the-knee-mea-006)
+> rather than reworded until it passed.
 
 ---
 
@@ -61,7 +63,7 @@ Packages mirror the component boundaries exactly, and no package depends upward.
 | `io.junction.balance` | Round-robin, least-conn, P2C, consistent hash | **built** |
 | `io.junction.backend` | Pool registry, health state machine, breaker, retry budget, slow start | **built** |
 | `io.junction.pool` | Per-EventLoop upstream connection pool | **built** |
-| `io.junction.admit` | Admission control, load shedding | Phase 4 |
+| `io.junction.admit` | Admission control, load shedding | **built** |
 | `io.junction.obs` | Metrics, structured access log, tracing | Phase 5 |
 | `io.junction.admin` | Admin HTTP API | Phase 6 |
 
@@ -173,7 +175,7 @@ evidence, and it is recorded as such.
 
 | Target | Result |
 |---|---|
-| ≥ 20k RPS on a dev machine | ❌ **Not met.** 14,134 median. The remaining 2.8× gap is unprofiled — Phase 4's job. Guessing at it now would be the wrong move. |
+| ≥ 20k RPS on a dev machine | ❌ **Not met.** 14,134 median containerised; 17,055 at the knee in-JVM (MEA-006, not comparable — different harness). The 2.8× gap is **still unprofiled**: attributing it needs the containerised control MEA-011 used, which the in-JVM harness cannot produce, and running the wrong benchmark would have been guessing with a number attached. Carried to Phase 5. |
 | p99 overhead ≤ 3 ms at 50% capacity | ⚠️ **Not measured.** The +13.8 ms above is at *saturation*, which is a different question. Not claimed either way. |
 | 1 GB upload, heap growth < 50 MB | ✅ **Met.** 1024 MB streamed, heap 6 MB → 7 MB (delta +0 MB), 21.2 s. |
 | Zero Netty leaks at `PARANOID` | ✅ **Met.** |
@@ -202,8 +204,73 @@ and no budget it would have been 3.000×.
 **And the honest limitation:** the retry budget bounds amplification, it does not
 make retries *smart*. A retry can land on the same dead backend it just failed
 against, because the breaker may not have tripped yet on one failure. That is
-visible in the tests and left as-is: preferring an untried backend is a Phase 4
-change, and it is the breaker's job to make it moot.
+visible in the tests and left as-is. Phase 4 was supposed to decide whether to add
+a "prefer a backend this request has not tried" pass, and decided **not to**:
+nothing has yet measured it mattering, and adding an unevidenced retry path in the
+phase about the proxy doing too much would have been the wrong instinct.
+
+### The knee (MEA-006)
+
+`./gradlew bench` sweeps offered concurrency against the proxy, five runs of four
+seconds per level, and prints where throughput stops paying for itself.
+
+```
+   conns   median rps          spread   median p99
+       1         2415     1386-2736         0.73ms
+       2         4891     4831-5197         0.74ms
+       4         7814     7450-8010         0.88ms
+       8        13363    13090-14116        1.88ms
+      16        17055    16722-17686        7.43ms   <- the knee
+      32        15953    13522-17056       23.09ms
+      64        16942    16280-17914       53.87ms
+     128        17227    15172-17793      108.20ms
+```
+
+**The knee is 16 concurrent requests.** Eight times that concurrency buys **1%
+more throughput and 15× the tail latency.** Every request offered past the knee
+is queueing, and queueing is all it buys — Little's law read straight off a
+table. This is the entire argument for admission control: a queue does not make
+an overloaded system faster, it makes the wait invisible until it is a timeout.
+
+*The load generator shares this JVM and these cores with the proxy, because wrk
+does not run on Windows and the containerised path is blocked (OPQ-010). The
+absolute figures are therefore not comparable to the 14,134 above, which was
+containerised. What this measures is the shape.*
+
+### The Phase 4 gate, and the part of it I could not measure
+
+| Criterion | Result |
+|---|---|
+| Served throughput stays flat at overload | ✅ **Met.** 4× the knee offered, served throughput unchanged. Asserted. |
+| The proxy still serves at its knee-rate service time | ✅ **Met.** p50 0.8–0.9 ms at 4× overload, identical to the knee. Asserted. |
+| The surplus is refused, not queued | ✅ **Met.** Asserted. |
+| p99 of served requests rises < 2× | ⚠️ **Not validated.** |
+
+The p99 criterion is not a failure of the proxy — it is a failure of the
+instrument, and it is worth being precise about which. The load generator runs in
+the same JVM as the proxy. At 64 client threads on a 12-thread machine, a served
+client waiting to be *scheduled* is indistinguishable from a slow proxy, and two
+runs of the identical configuration produced a served p99 of 46.5 ms and 74.8 ms
+— a run-to-run spread wider than the effect an assertion would be claiming. Over
+the same runs p50 never moved off 0.8–0.9 ms, which is what says the proxy itself
+was steady and the measurement was not.
+
+This gate is also the one that is **not** an assertion in `./gradlew test`, unlike
+every gate before it. The test task runs with a 256 MB heap and Netty leak
+detection at `PARANOID` — both of which the Phase 1 gate needs — and together they
+cost about 9× throughput. That does not merely make a load test slow, it makes it
+invalid: with the proxy that expensive, the in-process generator never gets 32
+requests in flight, so the "overload" run is not an overload. The first version of
+this gate failed in a way that looked like a latency problem and was not: it shed
+106 requests where it should have shed thousands. The shed count gave it away, not
+the timings.
+
+So the gate asserts what the harness can measure and prints p99 without a
+threshold. Validating it needs a load generator outside the process under test:
+wrk in a container, blocked on OPQ-010. **Recorded as unmet rather than reworded
+into something that passes** — an assertion whose result depends on which way the
+noise fell is worse than no assertion, because it reads as evidence.
+
 
 ---
 
@@ -263,6 +330,40 @@ half-dead pool would otherwise hand the survivors more than double their share a
 take them down in turn. Panic ignores health, not intent: a host an operator
 drained for maintenance is not conscripted back.
 
+**Admission control** — a process-wide cap on concurrently *in-flight* requests,
+not on requests per second. Requests per second is a number about the client;
+in-flight is a number about us, and by Little's law it is `throughput × latency`,
+so one bound covers both the queueing inside the process and the memory each
+request holds — and it stays true when a backend slows down, which is exactly when
+an RPS figure stops being true. Enforced with `Semaphore.tryAcquire()`, checked
+before routing, so a refusal costs no route lookup, no backend pick and no
+upstream connection.
+
+**There is deliberately no queue.** A queue in front of an overloaded service
+turns a fast, honest 503 into a slow 503 delivered to a client that gave up two
+seconds ago. MEA-006 is the price list for the queue this doesn't build.
+
+**Load shedding** — `503` with `Retry-After` and `X-Junction-Reason:
+over_capacity`. Not `429`: that says "*you* are sending too much", which is a
+claim about one client that a limit on *aggregate* concurrency does not entitle us
+to make — the request being shed may be the only one that client has sent all day.
+This is also the one Junction-generated error that does not close the connection:
+a refused request with no body has no bytes left to drain, so the connection stays
+framed, and closing it would charge every shed client a TCP handshake at exactly
+the load where handshakes are what you cannot afford. A refused request *with* a
+body still closes.
+
+**Timeouts, one guard per phase** — `request_timeout_ms` is armed when the request
+has been fully sent, not when it starts, so a client legitimately uploading over a
+slow link is no longer killed by a limit that exists to catch a silent backend.
+Moving that timer alone would have opened a hole: a backend that stalls mid-upload
+silences the client through Junction's own backpressure, which is precisely the
+case the idle timer declines to act on. So `stall_timeout_ms` covers the upload,
+firing only while `autoRead` is off — if reads are still on, the silence is the
+client's and the 408 timer owns it. The two guards partition the cases instead of
+racing for them. The 1 GB gate test used to need a ten-minute timeout to work
+around this; that workaround is gone, and its deletion is the proof.
+
 **Config** — immutable record graph, validated at startup. Every error is
 reported in one pass with a field path, and unknown keys are rejected outright:
 
@@ -293,32 +394,38 @@ before the next begins.
 | **1** | Core streaming proxy, routing, limits, config | 1 GB upload under 50 MB heap growth, zero leaks | ✅ done |
 | **2** | Backend pools, balancing (RR / least-conn / P2C / consistent hash), active health checks, per-EventLoop connection pool | Kill a backend mid-load → client error rate returns to 0 within 10 s | ✅ done |
 | **3** | Circuit breaker, outlier ejection, slow start, **retry budget**, panic mode | Total backend outage produces ≤ 1.1× normal upstream volume | ✅ done |
-| **4** | Admission control, load shedding, backpressure tuning, find the knee | At 2× the knee, served throughput stays flat and p99 rises < 2× | next |
-| **5** | Prometheus/Micrometer RED metrics, structured access log, Grafana dashboards, burn-rate alerts | A stranger diagnoses an injected fault from dashboards in 5 minutes | planned |
+| **4** | Admission control, load shedding, backpressure tuning, find the knee | At 2× the knee, served throughput stays flat and p99 rises < 2× | ⚠️ **partial** — throughput and p50 met, p99 unvalidated |
+| **5** | Prometheus/Micrometer RED metrics, structured access log, Grafana dashboards, burn-rate alerts | A stranger diagnoses an injected fault from dashboards in 5 minutes | next |
 | **6** | Graceful drain, hot config reload, admin API, capacity model, runbook, Game Day | Capacity model predicts measured max RPS within ±15% | planned |
 | 7 | Virtual-threads implementation benchmarked head-to-head against Netty | *optional* | planned |
 | 8 | fd exhaustion, ephemeral port exhaustion, accept-queue overflow, `TCP_NODELAY`/delayed-ACK — each reproduced and documented | *optional* | planned |
 
-**Open questions carried into Phase 4**, recorded before the work rather than
+**Open questions carried into Phase 5**, recorded before the work rather than
 rationalised after it:
 
-- Where does the remaining 2.8× proxy penalty actually go? Still unprofiled.
-  Candidates are the extra userspace copy per hop, per-message flush syscalls, and
-  Netty's 8 KB default chunk size. **Do not tune anything before profiling** —
-  Phase 4 profiles it, and every phase so far has resisted guessing at it.
-- `request_timeout_ms` is really a *total transaction* timeout: it is armed when
-  the request head goes upstream, so it spans the whole request-body upload. A
-  client legitimately uploading over a slow link is killed by a limit that exists
-  to catch a silent backend. Fixing it needs a separate stall detector, not a
-  moved timer — see OPQ-009. Phase 4 owns timeouts.
-- Retries currently cover the connect failure only. Covering an idempotent request
-  that was sent and got no response would need the request head retained past the
-  write, which is cheap; covering one with a body would need the body buffered,
-  which contradicts the streaming design. Decide whether the first is worth it.
-- Slow start ships **off by default**, because the right ramp is a property of the
-  backend and not of the proxy. That means the one Phase 3 feature with no default
-  behaviour is also the one least likely to be exercised in a demo. Measure it
-  against a real cold JVM before recommending a value.
+- **The knee is measured; a shippable default for it is not.** `max_in_flight`
+  ships as `0` — off. 16 is this machine's number, and shipping it would shed
+  traffic on any larger machine, which is a worse failure than shipping no bound.
+  That leaves admission control in exactly the position slow start is in: correct,
+  measured, and switched off in the config a reader will actually run. The
+  difference is that this one comes with a command. Either find a defensible
+  derivation, or say plainly that capacity is a per-deployment measurement and the
+  proxy's job is to make finding it cheap.
+- **The p99 gate needs a load generator outside the process under test.** See
+  above. Blocked on the same Docker problem as everything else measurement-shaped.
+- Where does the remaining 2.8× proxy penalty actually go? Still unprofiled after
+  Phase 4, deliberately — the harness Phase 4 built cannot produce the control
+  measurement the attribution needs. **Do not tune anything before profiling.**
+- A backend that hangs *mid-response* is reported to the client as `408
+  idle_timeout` — the client blamed for the backend's fault. Not a hang, just a
+  wrong code and a misleading reason label, which is exactly what costs an hour
+  during an incident. Phase 5's metrics should make the mislabelling visible.
+- Retries still cover the connect failure only. Phase 4's answer to whether to
+  widen them: **not yet** — retaining the request head is cheap, but nothing has
+  measured the sent-but-unanswered case happening, and adding an unevidenced retry
+  path in the phase about doing too much would have been the wrong instinct.
+- Slow start ships **off by default**, and was not measured against a cold JVM in
+  Phase 4. Still owed a defensible value or an admission that it is decoration.
 
 ---
 
@@ -393,6 +500,20 @@ did.
 **Test constraints beat test assertions.** `-Xmx256m` proves the streaming claim
 in a way `assertTrue(growth < 50MB)` never could. An assertion can drift as the
 code changes; a heap that cannot hold the payload cannot.
+
+**Check that the mechanism engaged before reading the numbers it produced.** The
+Phase 4 gate failed for three different reasons before it measured anything real,
+and every one was invisible in the timings: probes ejecting a saturated backend,
+a cold-JIT baseline compared against a warm overload, and a "2× overload" the
+generator could not actually deliver. The tell was never the latency — it was 106
+refusals where there should have been thousands. A number that looks plausible is
+the most expensive kind of wrong.
+
+**Know which part of a measurement is the instrument.** p99 moved by 60% between
+identical runs while p50 never moved at all. That gap is the whole story: the
+proxy was steady and the harness was not, and no amount of re-running would have
+turned that into a gate. Reporting it unmet took one paragraph; making it pass
+would have taken one constant.
 
 **Timing data is diagnostic data.** `time="0.242"` in a JUnit XML eliminated a
 plausible hypothesis instantly. The habit of asking "how *fast* did it fail?"

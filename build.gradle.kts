@@ -27,6 +27,21 @@ application {
     mainClass = "io.junction.Junction"
 }
 
+// R-44: the benchmark is a command, not a paragraph. `./gradlew bench` reproduces
+// MEA-006 and MEA-007; it is excluded from `test` because a benchmark that runs on
+// every build is one nobody can trust.
+tasks.register<Test>("bench") {
+    useJUnitPlatform()
+    systemProperty("junction.bench", "true")
+    filter { includeTestsMatching("*Bench") }
+    maxHeapSize = "512m"
+    testLogging {
+        showStandardStreams = true
+        events("passed", "failed")
+    }
+    outputs.upToDateWhen { false }
+}
+
 tasks.test {
     useJUnitPlatform()
     // R-6: Netty leak detection at PARANOID in tests. A leak found here blocks merge.

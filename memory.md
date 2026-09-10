@@ -194,6 +194,146 @@ than a health check in the balancer plus a weight check somewhere else.
 
 ---
 
+### DEC-012 … DEC-015 — **MISSING, recovered content needed**
+*Flagged 2026-09-09*
+
+These four entries were present in the working copy at the start of the Phase 4
+session and are absent now. `Revert "Stop tracking memory.md"` (48630c1) restored
+this file from the last commit that contained it — 55d0b7f, which predates
+Phase 3 — over a working copy whose Phase 3 additions had never been committed.
+Git therefore has no blob to recover them from.
+
+Lost, by title:
+
+- **DEC-012** — Panic mode is a selectability flag, not a `PickResult` variant
+- **DEC-013** — The circuit breaker *is* the passive outlier detector
+- **DEC-014** — Slow start ramps admission probability, not weight
+- **DEC-015** — Retries cover the connect failure only
+- **MEA-005** — Retry amplification under total backend outage *(the Phase 3
+  gate: 200 client requests -> 220 upstream attempts, 1.100x)* — the body is
+  gone, the stub heading remains
+- **SUR-003** — the two Phase 3 integration tests that failed for reasons about
+  the tests
+- The **2026-09-08 Phase 3 session log entry**
+
+The decisions themselves are all still implemented and commented in the code
+(`BackendPool`, `CircuitBreaker`, `SlowStart`, `RetryBudget`), and MEA-005's
+number survives in the README. What is lost is the reasoning and the costs, which
+is the part this file exists for.
+
+**Recovery:** the repo lives under OneDrive, which keeps per-file version history
+— right-click `memory.md` -> Version history, or the web UI. A version from
+2026-09-08 has all seven entries. This note stays until they are restored; it is
+not a placeholder to write around.
+
+---
+
+### DEC-016 — Admission control is a concurrency limit with no queue
+*Date: 2026-09-09 · Status: Accepted*
+
+**Context.** Phase 4 needs a bound on what the proxy will accept. The two obvious
+shapes are a rate limit (requests per second) and a concurrency limit (requests
+in flight), and the reflex on top of either is a small queue to smooth bursts.
+
+**Decision.** A process-wide cap on concurrently in-flight requests, enforced by
+`Semaphore.tryAcquire()`, with **no queue**: over the limit a request is shed
+immediately with 503.
+
+**Why a concurrency limit.** Requests per second is a number about the client;
+requests in flight is a number about us. By Little's law the in-flight count is
+exactly `throughput x latency`, so one bound on it bounds both the queueing
+inside the process and the memory every in-flight request holds — and it stays
+true when a backend slows down, which is precisely when an RPS figure stops
+being true. An operator setting an RPS limit has to guess a number that changes
+underneath them; setting a concurrency limit does not.
+
+**Why no queue.** A queue in front of an overloaded service converts a fast,
+honest 503 into a slow 503 delivered to a client that gave up two seconds ago.
+It is the single most common way p99 explodes past the knee, and shedding flat is
+what makes the Phase 4 gate achievable at all — MEA-006 shows the latency the
+queue would have charged.
+
+**Why `Semaphore` and not an `AtomicInteger`.** `tryAcquire()` is a non-blocking
+CAS that never parks a thread, so this is shared state without blocking (R-3) —
+the same trade `ConnectionLimitHandler` already makes — and `release()` is
+symmetric, which a hand-rolled compare-and-increment is not.
+
+**Cost.** The permit is held from the request head until the response is fully
+written, which is strictly longer than the client's view of the same request. A
+closed-loop client offering exactly `max_in_flight` connections therefore sheds
+at the margin. See SUR-004.
+
+---
+
+### DEC-017 — Shed with 503 and `Retry-After`, not 429
+*Date: 2026-09-09 · Status: Accepted, resolves OPQ-001*
+
+**Decision.** `503 Service Unavailable` with `Retry-After: 1` and
+`X-Junction-Reason: over_capacity`.
+
+**Why not 429.** 429 says "you are sending too much". That is a statement about
+one client, and it is a claim we are not entitled to make: the limit is on
+aggregate concurrency, and the request being shed may be the only one that client
+has sent all day. 503 plus `Retry-After` says "this server, right now", which is
+the true statement and the one a well-behaved client backs off on.
+
+**Why the shed response does not close the connection.** Every other
+Junction-generated error closes, because it happens mid-stream and the remaining
+request bytes would be parsed as a bogus next request. A shed request with no
+body has no remaining bytes, so the connection stays framed and reusable —
+and closing it would charge every shed client a TCP handshake at exactly the load
+where handshakes are the cost we cannot afford. A shed request that *does* carry
+a body still closes: draining an upload we have already refused is worse than
+dropping the connection.
+
+**`Retry-After` is deliberately not a config knob.** It only has to be long
+enough that a client's retry lands after the burst that shed it. MEA-007 shows
+what happens with a client that ignores it entirely.
+
+---
+
+### DEC-018 — One timeout per phase: response head, then stall
+*Date: 2026-09-09 · Status: Accepted, resolves OPQ-009, supersedes the Phase 1 timer*
+
+**Context.** `request_timeout_ms` was armed when the request head went upstream
+and cancelled when the response head returned, so it spanned the entire request
+body upload. A client legitimately uploading over a slow link was killed by a
+limit that exists to catch a silent backend. Surfaced when the 1 GB gate test
+started tripping the 30s default at ~31s.
+
+**Decision.** Split the transaction into phases with exactly one guard each.
+
+| phase | guard | on expiry |
+|---|---|---|
+| request body streaming | stall check (`stall_timeout_ms`) | 504 `upstream_stalled` |
+| waiting for the response head | `request_timeout_ms` | 504 `request_timeout` |
+| response streaming | downstream idle timer | 408 `idle_timeout` (see OPQ-015) |
+
+**Why the obvious fix was not enough.** Simply arming the response timeout later
+leaves the upload unguarded, and unguarded is worse than mistimed: if the backend
+stops draining mid-upload, our own write buffer fills, backpressure switches
+downstream reads off, and the idle timer is suppressed *on purpose* because the
+client's silence is our doing (SUR-002). Nothing at all would have been watching,
+and the connection would have hung until one side gave up. The stall check has to
+exist for the move to be safe, which is why they shipped together.
+
+**Why the stall check re-arms against a timestamp instead of resetting per
+chunk.** A 1 GB upload is roughly 130,000 chunks. A timer operation per chunk
+would cost more than the transfer. The check schedules itself for the remaining
+time whenever it finds recent progress, which is what `IdleStateHandler` does
+internally and costs one timer operation per period rather than per message.
+
+**Why it only fires when `autoRead` is off.** If reads are still on, the silence
+is the client's and the idle timer owns it (408). The two guards partition the
+cases rather than racing for them.
+
+**Evidence.** `TimeoutIntegrationTest.aSlowUploadIsNotKilledByTheResponseTimeout`
+fails against the old arming point and passes against the new one — verified by
+restoring the old line, not by reasoning. `StreamingGateTest` dropped the
+ten-minute timeout it needed as a workaround; that deletion is the proof.
+
+---
+
 ## Measurements
 
 *Populate as you go. Every entry needs: what was measured, the exact command,
@@ -300,8 +440,70 @@ land on. Netty assigns loops round-robin across ~2x cores, so the miss rate is
 roughly the chance of landing on a cold loop. Directly relevant to OPQ-002.
 ### MEA-004 — P2C vs. least-connections in-flight variance
 ### MEA-005 — Retry amplification under total backend outage
-### MEA-006 — The knee: throughput and p99 vs. offered load
-### MEA-007 — Shed-path latency at 5x capacity
+### MEA-006 — The knee: throughput and p99 vs. offered load  *(Phase 4, done)*
+```
+Date:      2026-09-09
+Hardware:  Windows 11, Intel i7-9750H (6C/12T @2.60GHz), 15.9 GB RAM
+JVM:       eclipse-temurin:21 toolchain, Netty 4.1.115.Final
+Command:   ./gradlew bench          (KneeSweepBench, 5 runs of 4s per level)
+Setup:     3 chaos backends, P2C, probes dormant, no backend delay,
+           admission control OFF - the knee has to be found before there is any
+           point choosing a limit to put in front of it
+
+   conns   median rps          spread   median p99   errors
+       1         2415     1386-2736         0.73ms        0
+       2         4891     4831-5197         0.74ms        0
+       4         7814     7450-8010         0.88ms        0
+       8        13363    13090-14116        1.88ms        0
+      16        17055    16722-17686        7.43ms        0     <- the knee
+      32        15953    13522-17056       23.09ms        0
+      64        16942    16280-17914       53.87ms        0
+     128        17227    15172-17793      108.20ms        0
+```
+**The knee is 16 concurrent requests.** Throughput saturates there and does not
+move again: 128 concurrent buys **1% more throughput than 16, and 15x the tail**
+(7.43ms -> 108.20ms). Every request offered past the knee is queueing, and
+queueing is the only thing it buys. This is Little's law read off a table, and it
+is the entire argument for admission control: the queue does not make the system
+faster, it makes the wait invisible until it is a timeout.
+
+**Caveat that travels with these numbers.** The load generator shares this JVM
+and these cores with the proxy and the backends, because wrk does not run on
+Windows and the containerised path is blocked by OPQ-010. Absolute throughput is
+therefore **not comparable to MEA-011's 14,134**, which was containerised. What
+this measures is the *shape*, and the shape is what sets `max_in_flight`.
+
+**A finding from the first attempt, kept because it cost an hour.** With the
+harness's fast test probes (200ms interval, 100ms timeout) the sweep produced
+hundreds of 503s at 64 and 128 concurrent. Those were not overload errors: a
+backend saturated by this very load answers its health probe late, so active
+health checking ejected the pool mid-run. Fixture settings rather than the
+shipped ones (2s/500ms) - but it does mean active health checking and throughput
+measurement cannot both be switched on in one process, and a probe timeout has to
+be set against the *loaded* response time, not the idle one.
+
+### MEA-007 — Shed-path latency at 5x capacity  *(Phase 4, done)*
+```
+Date:      2026-09-09
+Command:   ./gradlew bench   (KneeSweepBench.shedPathLatencyAtFiveTimesTheLimit)
+Setup:     max_in_flight=16, 80 client connections (5x the limit), backend
+           delay 20ms, and clients that ignore Retry-After completely - zero
+           backoff, retry the instant they are refused
+Measured:  served  1,948 at 428 rps, p50 31.95ms, p99 71.61ms
+           shed   90,014, p99 41.98ms
+           other       0
+```
+**The number that matters is 90,014.** In five seconds, 64 refused clients
+generated eighteen thousand refusals a second - **42x the useful traffic** the
+proxy was serving at the same time. Shedding is cheap per request; shedding
+18,000 times a second while also serving is not, and the served p50 of 31.95ms
+against a 20ms backend shows where the missing 12ms went.
+
+So the shed p99 of 41.98ms is not the cost of refusing a request. It is the cost
+of refusing at that rate, and it is self-inflicted by the client. This is the
+concrete argument for `Retry-After` (DEC-017) and the reason the gate benchmark
+models a client that honours it: a proxy cannot shed its way out of a client
+population that treats a refusal as a signal to try harder.
 ### MEA-008 — Capacity model predicted vs. actual
 ### MEA-009 — 1-hour soak: heap trend, fd count
 ### MEA-010 — Netty vs. virtual threads (Phase 7)
@@ -445,9 +647,79 @@ Promote to FA? Not yet — no observed failure. Revisit after Phase 4 proves it.
 
 ---
 
+### SUR-004 — a permit outlives the request the client can see
+```
+Date:     2026-09-09  (Phase 4, found while building the gate benchmark)
+Symptom:  A closed-loop client offering exactly max_in_flight connections was
+          shed on 43% of its requests. With 16 clients and 16 permits, nothing
+          should ever have been refused.
+Mechanism:
+      The permit is taken when the request head is read and returned in
+      finishRequest(), which runs immediately after the last response chunk is
+      flushed. The client sees the response the instant those bytes land — a few
+      microseconds before the proxy's own bookkeeping completes. A client that
+      replies instantly can therefore have its next request arrive while the
+      previous permit is still held.
+      That alone is a small margin. What made it 43% is the feedback: a shed
+      client retries with no delay, so one transient over-limit event puts a
+      client into a spin loop, and a spinning client grabs the freed permit
+      before a steady client — which needs a full round trip — can ask for it.
+      The steady client is then shed and starts spinning too. The system is
+      metastable at offered == limit.
+Fix:  None in the proxy; this is correct behaviour. The permit genuinely covers
+      a longer interval than the client observes, and it has to. Two consequences
+      were absorbed elsewhere instead:
+        - The Phase 2 admission tests wait for the count to settle rather than
+          asserting it the instant a client has its response (asserting it
+          immediately is asserting the race).
+        - The Phase 4 gate benchmark measures its baseline with headroom, and
+          says why in the test's own javadoc. That is experimental design, not a
+          thumb on the scale.
+Promote to FA? Not on its own. It is a good illustration of "the metric and the
+      client disagree about when a request ended", and belongs in the writeup of
+      the gate rather than as its own entry.
+```
+
+---
+
+### SUR-005 — the gate could not be measured in the test JVM
+```
+Date:     2026-09-09  (Phase 4)
+Symptom:  The Phase 4 gate failed under ./gradlew test with numbers that made no
+          sense: 2,497 rps where the same code did 16,358 in the bench task, and
+          only 106 shed responses at twice the configured limit — the limiter
+          appeared not to be engaging at all.
+Mechanism:
+      The test task runs with -Xmx256m and Netty leak detection at PARANOID,
+      both of which the Phase 1 gate requires. PARANOID instruments every buffer
+      allocation and costs roughly 9x throughput here.
+      The failure is not that it is slow. The load generator shares this JVM, so
+      when the proxy is that expensive the 32 client threads never manage to hold
+      32 requests in flight — they spend their time waiting for CPU, not waiting
+      on the proxy. The overload run was not an overload, so the limiter had
+      nothing to refuse, and the p99 rise being measured was the client's own
+      scheduling delay rather than the proxy's queue.
+Fix:  Moved the gate to `./gradlew bench`, which runs without leak detection and
+      with a 512m heap, and recorded why in the class javadoc.
+Lesson:
+      A green gate in an environment that cannot produce the load is worse than
+      no gate, because it reads as evidence. The tell was the shed count: 106
+      refusals at twice the limit is not a slow machine, it is a machine that
+      never reached the limit. Checking whether the *mechanism* engaged, before
+      reading the numbers it produced, is what caught it.
+Promote to FA? No — a measurement-methodology error, not a product failure. It is
+      the honest reason the Phase 4 gate lives in a different Gradle task from
+      every other gate, and the README says so rather than glossing it.
+```
+
+---
+
 ## Open questions
 
-**OPQ-001** — Shed response 503 or 429? Leaning 503 + `Retry-After`. Resolve by Phase 4.
+**OPQ-001** — ~~Shed response 503 or 429?~~ **RESOLVED 2026-09-09.** 503 plus
+`Retry-After: 1` and `X-Junction-Reason: over_capacity`. See DEC-017: 429 is a
+claim about one client that a limit on aggregate concurrency does not entitle us
+to make.
 
 **OPQ-002** — Per-EventLoop pools mean up to `cores x maxIdle` idle conns per
 backend. Measure actual socket count in Phase 2 and decide.
@@ -471,6 +743,15 @@ many small HttpContent messages, and the one-upstream-connection-per-downstream
 pinning limiting upstream parallelism. *Profile in Phase 4 rather than guessing;
 do not tune anything before then.*
 
+**Phase 4 did not do this, and the reason matters.** Attributing a 2.8x penalty
+needs a comparison against the direct-to-backend control on the same footing as
+MEA-011, which was containerised. The in-JVM harness Phase 4 built cannot produce
+that comparison — the load generator competes with the proxy for the same cores,
+so any difference it measures is partly its own. Guessing was the one thing every
+previous phase refused to do here, and running the wrong benchmark would have
+been guessing with a number attached. *Carried to Phase 5, which needs a working
+containerised path for its dashboards anyway (blocked on OPQ-010).*
+
 **OPQ-010** — The repo lives under `C:\Users\prana\OneDrive\...`, and OneDrive
 Files-On-Demand turns untouched files into reparse-point placeholders. Docker's
 BuildKit cannot read them: `docker build` failed with
@@ -484,7 +765,13 @@ it recently — i.e. exactly the "clean machine" case in the success metrics.
 *Resolve by moving the working copy off OneDrive before Phase 6, or the demo
 fails for the one audience it exists for.*
 
-**OPQ-009** — `request_timeout_ms` is really a *total transaction* timeout. The
+**OPQ-009** — ~~`request_timeout_ms` is really a *total transaction* timeout.~~
+**RESOLVED 2026-09-09.** Split into a response-head timeout armed when the upload
+finishes and a stall check that covers the upload, so every phase has exactly one
+guard. See DEC-018; the original entry is kept below because the reasoning about
+why the obvious fix was insufficient is the useful part.
+
+`request_timeout_ms` is really a *total transaction* timeout. The
 timer is armed when the request head goes upstream and cancelled when the
 response head returns, so it spans the entire request-body upload. A client
 legitimately uploading a large body over a slow link is therefore killed by a
@@ -499,6 +786,71 @@ suppressed by the guard from SUR-002. Nothing would ever fire and the
 connection would hang indefinitely. A correct design needs a separate stall
 detector (no forward progress for N ms) alongside a response-head timeout.
 *Resolve in the phase that does timeouts properly; do not bolt it on.*
+
+**OPQ-011** — Retries cover the connect failure only (DEC-015). Retrying a
+request that *was* sent and got no response back is safe for an idempotent method
+and needs only the request head retained past the write — cheap, and it covers the
+"backend accepted the connection then died" case that the connect retry misses.
+*Decide in Phase 4; do not widen it to bodied requests, that direction is closed.*
+
+**Phase 4's answer: not yet, and not for the stated reason.** Retaining the head
+is indeed cheap, but the case it covers is already bounded by the breaker and the
+retry budget, and Phase 4 produced no measurement showing it happening. Building
+it now would be adding a retry path with no evidence behind it, in the phase whose
+entire subject is what happens when the proxy does too much. *Revisit when
+something measures the sent-but-unanswered case actually occurring.*
+
+**OPQ-012** — A retry can land on the same backend that just failed, because one
+failure is usually not enough to trip the breaker. Bounded by the budget so it
+cannot storm, and the breaker makes it moot within a few requests, but a
+"prefer a backend this request has not tried" pass would be strictly better.
+*Measure whether it matters before building it — it may be pure ceremony once the
+breaker is tuned.* Still unmeasured after Phase 4.
+
+**OPQ-013** — Slow start ships **off by default** (`slow_start_ms: 0`), because
+the correct ramp is a property of the backend's warm-up curve and not of the
+proxy. That makes it the one Phase 3 feature with no default behaviour, and so the
+one least likely to be exercised. *Measure a real cold JVM's throughput curve in
+Phase 4 or 5 and put a defensible default in the shipped config, or admit it is
+decoration.* Not measured in Phase 4 — and note that `max_in_flight` now ships
+with exactly the same problem, for exactly the same reason (OPQ-016).
+
+**OPQ-014** — Panic is recomputed with an O(backends) scan on every pick. Same
+order the strategies already scan in, and pools here are tens of backends, so it
+is almost certainly free. *If profiling in Phase 4 disagrees, recompute on health
+transitions instead — but the flag write is already transition-only, so measure
+before moving anything.* No profiling was run; MEA-006 shows the proxy saturating
+at ~17k rps with panic disabled, which is not evidence either way.
+
+**OPQ-015** — A backend that hangs *mid-response* — head sent, body stops, socket
+left open — terminates, but through the downstream idle timer, so the client is
+told `408 idle_timeout`. The client is being blamed for the backend's fault. The
+phase guards from DEC-018 cover the upload and the response head; the response
+body is the one stretch where the only timer running belongs to the wrong party.
+*Not a hang, just a wrong status code and a misleading reason label — which is
+exactly the sort of thing that costs an hour during an incident. Fix when the
+metrics in Phase 5 make the mislabelling visible.*
+
+**OPQ-016** — Is there a portable default for `max_in_flight`, or must it always
+be measured? MEA-006 found this machine's knee at 16 concurrent, but that is a
+property of the cores, the event-loop count and the backend, not of Junction. A
+shipped 16 would shed traffic on any machine larger than this one, which is a
+worse failure than shipping no bound at all. So it ships as 0, off — the same
+position DEC-014's slow start is in, and open to the same criticism. The
+difference is that this one now comes with a measurement and a reproducible
+command. *Either find a defensible derivation — a multiple of the worker count is
+the obvious candidate, and is entirely unvalidated — or state plainly that
+capacity is a per-deployment measurement and that the proxy's job is to make
+finding it cheap.*
+
+**OPQ-017** — The Phase 4 gate's p99 criterion is unvalidated because the load
+generator shares a JVM and a CPU with the proxy under test. With 64 client threads
+on a 12-thread machine, a served client waiting to be scheduled is
+indistinguishable from a slow proxy, and repeat runs of one configuration put the
+served p99 at 46.5ms and 74.8ms — a spread wider than the effect being asserted,
+while p50 held at 0.8-0.9ms throughout. *Needs an out-of-process generator: wrk in
+a container, which is blocked on OPQ-010, or a second JVM on the host. Until then
+the gate asserts throughput and p50 and reports p99 without a threshold.*
 
 **OPQ-008** — Phase 1 pins exactly one upstream connection per downstream
 connection (DEC-007). This caps upstream concurrency at the downstream
@@ -561,6 +913,47 @@ Numbers: MEA-011 — 14,134 RPS median / p99 27.1ms through Junction vs 39,543 /
          NFR-2 explicitly NOT measured (needs a 50%-of-capacity run).
 
 Stopped at: Phase 1 complete, all gate criteria green, committed.
+
+### 2026-09-09 — Phase 4 (Admission control, shedding, timeouts, the knee)
+Did:     io.junction.admit: a process-wide in-flight cap on Semaphore.tryAcquire,
+         no queue (DEC-016), wired into ProxyFrontendHandler ahead of routing so
+         a refusal costs no route lookup, no pick and no upstream connection.
+         Shed with 503 + Retry-After, keeping the connection alive when the
+         refused request has no body to drain (DEC-017, resolves OPQ-001).
+         Split the transaction timeout: response-head timer armed when the upload
+         completes, plus a stall check covering the upload that fires only while
+         our own backpressure holds the client silent (DEC-018, resolves OPQ-009).
+         Made the write-buffer watermarks configurable and plumbed them into the
+         upstream pool as well as the listener - the upload valve trips on the
+         upstream buffer, so tuning only the downstream one tunes half a valve.
+         Built a closed-loop load generator on RawHttp and a `bench` Gradle task.
+Measured: MEA-006 (the knee: 16 concurrent, 17,055 rps, p99 7.43ms; 128 concurrent
+         buys 1% more throughput and 15x the tail) and MEA-007 (the shed path
+         under a client that ignores Retry-After: 18,000 refusals a second, 42x
+         the useful traffic).
+Gate:    PARTIAL. Throughput stays flat past the knee and p50 is unchanged under
+         4x overload - both asserted in AdmissionGateBench. The p99 criterion is
+         NOT validated: OPQ-017, the generator shares a CPU with the proxy and its
+         run-to-run spread is wider than the effect. Recorded as unmet rather than
+         reworded into something that passes.
+Surprises: SUR-004 (a permit outlives the request the client can see, and a
+         closed loop at exactly the limit is metastable) and SUR-005 (the gate
+         could not be measured in the test JVM at all, and the tell was the shed
+         count, not the timings).
+Also:    Found that DEC-012..015, MEA-005, SUR-003 and the Phase 3 session log
+         entry are missing from this file - see the marker in Decisions. Not
+         caused by Phase 4's edits; the revert commit restored a pre-Phase-3 blob
+         over uncommitted work. Flagged to the author with the OneDrive recovery
+         path rather than reconstructed, because a half-remembered decision record
+         is worse than an obviously missing one.
+Stopped at: Phase 4 code and measurements complete, docs updated, uncommitted.
+Next:    Phase 5 - Prometheus/Micrometer RED metrics, structured access log,
+         Grafana dashboards, burn-rate alerts. Carry in: OPQ-007 (still
+         unprofiled, needs the containerised path), OPQ-010 (OneDrive still
+         breaks docker build, and it is now blocking two things), OPQ-015 (a
+         mid-response backend hang is reported as 408), OPQ-016 (no defensible
+         default for max_in_flight), OPQ-017 (the gate needs an out-of-process
+         load generator).
 
 ### 2026-08-09 — Phase 2 (Pools, balancing, health)
 Did:     PHASE 2 GATE GREEN. Built the whole phase across backend / balance /

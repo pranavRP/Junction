@@ -31,7 +31,12 @@ server:
   # backend slows down and an RPS figure would not. There is no queue: over the
   # limit a request is shed immediately, because a queue in front of an
   # overloaded service only converts a fast 503 into a slow one.
-  # 0 disables it. The shipped value comes from MEA-006, not from taste.
+  # 0 disables it, which is what ships — and that is a compromise, not a default.
+  # MEA-006 measured this machine's knee at 16 concurrent: past it, throughput
+  # stops rising and only the tail moves (7.4ms at 16, 108ms at 128, for 1% more
+  # throughput). But 16 is a property of these cores and this backend, so shipping
+  # it would shed traffic on any larger machine — a worse failure than no bound.
+  # Find yours with `./gradlew bench` and set it. See OPQ-016.
   max_in_flight: 0
 
   # Pending write bytes that trip the autoRead valve (DEC-005). Too low and the
